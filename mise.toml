@@ -35,7 +35,7 @@ echo "$dmg"
 
 [tasks.fmt]
 description = "Format Rust and frontend"
-run = ["cargo fmt --manifest-path src-tauri/Cargo.toml", "bunx oxfmt ."]
+run = ["cargo fmt --all --manifest-path src-tauri/Cargo.toml", "bunx oxfmt ."]
 
 [tasks.lint]
 description = "Lint and typecheck"

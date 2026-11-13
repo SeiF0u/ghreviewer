@@ -25,7 +25,7 @@ export type PrSummary = {
   context: boolean;
   /** Tickets named in the title and found in Jira. */
   jira: TicketRef[];
-  /** Who the PR waits on, for the smart inbox (`Next` in src-tauri/src/sync.rs). */
+  /** Who the PR waits on, for the smart inbox (`Next` in src-tauri/core/src/sync.rs). */
   next: Next | null;
   /** Snoozed until then (ms): goes under the smart inbox's "can wait" line. */
   snoozedUntil: number | null;
@@ -43,7 +43,7 @@ export type Next =
 
 /** `category` is Jira's status category: `new`, `indeterminate` (in progress) or `done`. */
 export type TicketRef = { key: string; category: string };
-/** A Jira issue (src-tauri/src/jira.rs). The HTML is Jira's own rendering: sanitize it. */
+/** A Jira issue (src-tauri/core/src/jira.rs). The HTML is Jira's own rendering: sanitize it. */
 export type Ticket = TicketRef & {
   url: string;
   summary: string;
@@ -99,7 +99,7 @@ export type Prompt = {
   prompt: string;
   args: string[];
 };
-/** Latest run of a prompt on a PR (src-tauri/src/agent.rs). */
+/** Latest run of a prompt on a PR (src-tauri/core/src/agent.rs). */
 export type Run = {
   prId: string;
   repo: string;
@@ -143,7 +143,7 @@ export type Settings = Pick<
   "poll_interval_secs" | "theme" | "smart_inbox" | "rules" | "filters" | "jira"
 >;
 
-// PR detail, in the shape of the GraphQL query in src-tauri/src/sync.rs.
+// PR detail, in the shape of the GraphQL query in src-tauri/core/src/sync.rs.
 type Login = { login: string } | null;
 export type Nodes<T> = { nodes: (T | null)[] } | null;
 export type Reviewer = { login?: string; name?: string } | null;
@@ -237,7 +237,7 @@ export type PrDetail = {
 export const list = <T>(n: Nodes<T> | undefined): T[] =>
   (n?.nodes ?? []).filter((x): x is T => x != null);
 
-/** The PR a run works on (`Target` in src-tauri/src/lib.rs). */
+/** The PR a run works on (`Target` in src-tauri/core/src/lib.rs). */
 const target = (pr: PrDetail) => ({
   id: pr.id,
   repo: pr.repository.nameWithOwner,

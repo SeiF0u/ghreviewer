@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Local macOS app to triage GitHub PRs. Tauri 2 (Rust in `src-tauri/`) + React/TS (`src/`). User docs: `README.md`. Design rules: `PRODUCT.md` (binding: monospace, straight lines, no rounding, no shadows).
+Local macOS app to triage GitHub PRs. Tauri 2 (Rust in `src-tauri/`: UI-free logic in `src-tauri/core/`, Tauri commands in `src-tauri/src/`) + React/TS (`src/`). User docs: `README.md`. Design rules: `PRODUCT.md` (binding: monospace, straight lines, no rounding, no shadows).
 
 ## Commands
 

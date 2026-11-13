@@ -1338,16 +1338,27 @@ name = "ghreviewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dirs",
- "notify",
+ "ghreviewer-core",
  "percent-encoding",
- "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
+]
+
+[[package]]
+name = "ghreviewer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "notify",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "toml_edit 0.25.19+spec-1.1.0",

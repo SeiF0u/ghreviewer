@@ -40,7 +40,7 @@ const NO_RUNS: Run[] = [];
 const NO_TICKETS: Ticket[] = [];
 /** Name of the Jira tab among the PR pane tabs (the others are "" and prompt names). */
 const JIRA_TAB = "<jira>";
-/** Prompt name of the fix agent's runs (`FIX` in src-tauri/src/lib.rs). */
+/** Prompt name of the fix agent's runs (`FIX` in src-tauri/core/src/lib.rs). */
 const FIX = "fix";
 
 /** useState that survives relaunches (webview localStorage). */

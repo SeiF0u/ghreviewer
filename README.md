@@ -265,7 +265,7 @@ Create the token at <https://id.atlassian.com/manage-profile/security/api-tokens
 
 ## Development
 
-The app is Tauri 2: a Rust backend in `src-tauri/` (GitHub GraphQL, sync loop, SQLite, worktrees, agents) and a React + TypeScript frontend in `src/` (TanStack Query, plain CSS).
+The app is Tauri 2: a Rust backend in `src-tauri/` (the `core/` crate: GitHub GraphQL, sync loop, SQLite, worktrees, agents) and a React + TypeScript frontend in `src/` (TanStack Query, plain CSS).
 
 ```sh
 mise run dev    # run with hot reload
