@@ -1,7 +1,7 @@
 # The desktop app is the root package: `cargo test`/`clippy` here cover every crate.
 [workspace]
-members = ["core"]
-default-members = [".", "core"]
+members = ["core", "tui"]
+default-members = [".", "core", "tui"]
 
 [package]
 name = "ghreviewer"

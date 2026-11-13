@@ -275,3 +275,13 @@ mise run fmt    # cargo fmt + oxfmt
 ```
 
 `cd src-tauri && cargo test -- --ignored live --nocapture` runs a sync against GitHub with your `gh` login.
+
+### Terminal UI (experimental)
+
+`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. For now it shows the inbox and PRs, and marks read, snoozes and filters.
+
+```sh
+cd src-tauri && cargo run -p ghreviewer-tui
+```
+
+Review-comment hunks go through [delta](https://github.com/dandavison/delta) when it's installed. Over SSH, `o` copies the PR link to your clipboard (OSC 52; tmux needs `set -g set-clipboard on`).

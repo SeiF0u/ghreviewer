@@ -1,5 +1,8 @@
 import type { Finding, Next, PrDetail, PrSummary, Run, TicketRef } from "./api";
 
+// Inbox ranking, stacks and filtering have a Rust twin for the TUI (src-tauri/core/src/inbox.rs):
+// change both, with their tests.
+
 export type SideItem =
   | { key: string; kind: "run"; run: Run }
   | { key: "all"; kind: "all"; total: number; unread: number }

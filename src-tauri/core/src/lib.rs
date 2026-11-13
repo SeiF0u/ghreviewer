@@ -8,6 +8,7 @@ pub mod agent;
 pub mod config;
 pub mod db;
 pub mod github;
+pub mod inbox;
 pub mod jira;
 pub mod local;
 pub mod sync;
