@@ -31,7 +31,20 @@ pub fn command(program: &str) -> Command {
         .unwrap_or(current);
     let mut cmd = Command::new(program);
     cmd.env("PATH", path).kill_on_drop(true);
+    // In a session of its own, without the TUI's terminal: an interactive shell (Jira's token
+    // lookup) or an agent would take it over and swallow its keys.
+    // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
+    unsafe {
+        cmd.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
     cmd
+}
+
+unsafe extern "C" {
+    fn setsid() -> i32;
 }
 
 pub fn expand(root: &str) -> PathBuf {
