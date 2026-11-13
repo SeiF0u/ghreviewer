@@ -1,7 +1,10 @@
 //! The PR pane: a PR detail (the GraphQL JSON of `sync.rs`) as lines, like `src/PrView.tsx`.
 
 use ansi_to_tui::IntoText;
-use ghreviewer_core::inbox::{parse_ms, rel_time, tail_patch};
+use ghreviewer_core::{
+    inbox::{parse_ms, rel_time, tail_patch},
+    jira::Ticket,
+};
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -398,4 +401,87 @@ fn thread(out: &mut Vec<Line<'static>>, t: &Value, width: usize, now: u64) {
         ]));
         out.extend(html(s(c, "/bodyHTML"), width));
     }
+}
+
+/// Color of a Jira status category: to do, in progress, done.
+pub fn jira_color(category: &str) -> Color {
+    match category {
+        "indeterminate" => ACCENT,
+        "done" => OK,
+        _ => DIM,
+    }
+}
+
+/// The Jira tab: ticket `t`, among the `keys` named in the PR title. Like `src/JiraView.tsx`.
+pub fn jira_lines(t: &Ticket, keys: &[String], width: usize, now: u64) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if keys.len() > 1 {
+        let mut tabs = vec![];
+        for (i, k) in keys.iter().enumerate() {
+            if i > 0 {
+                tabs.push(Span::styled(" │ ", DIM));
+            }
+            let style = if *k == t.key {
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(DIM)
+            };
+            tabs.push(Span::styled(k.clone(), style));
+        }
+        tabs.push(Span::styled("  { } tickets", DIM));
+        out.push(Line::from(tabs));
+        out.push(Line::raw(""));
+    }
+    out.push(Line::from(vec![
+        Span::styled(t.summary.clone(), Modifier::BOLD),
+        Span::styled(format!(" {}", t.key), DIM),
+    ]));
+    out.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", t.status.to_lowercase()),
+            Style::new().fg(Color::Black).bg(jira_color(&t.category)),
+        ),
+        Span::raw(format!(" {}", t.kind)),
+    ]));
+    out.push(Line::styled(t.url.clone(), DIM));
+    out.push(Line::raw(""));
+    let key = |k: &str| Span::styled(format!("{k:<10}"), DIM);
+    let assignee = Some(t.assignee.clone().unwrap_or_else(|| "unassigned".into()));
+    for (k, v) in [
+        ("assignee", assignee),
+        ("reporter", t.reporter.clone()),
+        ("priority", t.priority.clone()),
+    ] {
+        if let Some(v) = v {
+            out.push(Line::from(vec![key(k), Span::raw(v)]));
+        }
+    }
+    if let Some(p) = &t.parent {
+        out.push(Line::from(vec![
+            key("parent"),
+            Span::raw(format!("{} {} ", p.key, p.summary)),
+            Span::styled(p.kind.clone(), DIM),
+        ]));
+    }
+    if !t.labels.is_empty() {
+        out.push(Line::from(vec![
+            key("labels"),
+            Span::raw(t.labels.join(", ")),
+        ]));
+    }
+    out.extend(section("Description".into()));
+    match t.description_html.as_str() {
+        "" => out.push(Line::styled("No description.", DIM)),
+        body => out.extend(html(body, width)),
+    }
+    out.extend(section(format!("Comments · {}", t.comments.len())));
+    for c in &t.comments {
+        out.push(Line::raw(""));
+        out.push(Line::from(vec![
+            Span::styled(c.author.clone(), Modifier::BOLD),
+            Span::styled(format!(" · {}", ago(&c.created, now)), DIM),
+        ]));
+        out.extend(html(&c.body_html, width));
+    }
+    out
 }

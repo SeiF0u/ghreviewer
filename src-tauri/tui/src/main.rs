@@ -13,6 +13,7 @@ use ghreviewer_core::{
         BotReview, PrRow, bot_reviews, by_next, can_approve, can_wait, matches_filter, parse_ms,
         picked_by_default, rel_time, stack_leads, stack_rows,
     },
+    jira::Ticket,
     local::Worktree,
     sync::PrSummary,
 };
@@ -71,7 +72,11 @@ const HELP: &[(&str, &str)] = &[
         "open a run listed above the inbox, or go to the PR pane",
     ),
     ("Ctrl-d / Ctrl-u", "scroll the PR pane half a page"),
-    ("[ / ]", "previous / next tab: the PR, then each prompt"),
+    (
+        "[ / ]",
+        "previous / next tab: the PR, Jira, review bots, then each prompt",
+    ),
+    ("{ / }", "previous / next ticket (Jira tab)"),
     ("/", "filter the inbox; Esc clears it"),
     ("t", "next rule (all, then each rule)"),
     ("o", "open the PR in the browser (over SSH: copy its link)"),
@@ -126,7 +131,12 @@ struct App {
     detail_key: Option<(String, String, Option<String>)>,
     detail: Option<(String, Value)>,
     /// `detail` rendered at a width.
-    lines: Option<(u16, Vec<Line<'static>>)>,
+    /// What the PR or Jira tab shows ("" for the PR, else the ticket key), rendered at a width.
+    lines: Option<(String, u16, Vec<Line<'static>>)>,
+    /// Jira tickets named in the selected PR's title, from the cache the sync fills.
+    tickets: Vec<Ticket>,
+    /// The ticket the Jira tab shows, the first one by default.
+    ticket_key: String,
     scroll: u16,
     pane_height: u16,
     pending_g: bool,
@@ -151,6 +161,9 @@ struct App {
     /// The run under the cursor, when it's in that list rather than on a PR.
     run_sel: Option<usize>,
 }
+
+/// Name of the Jira tab among the PR pane's tabs ("" for the PR, `<bot>`, prompt names).
+const JIRA_TAB: &str = "<jira>";
 
 fn review_key(run: &Run) -> String {
     format!("{}/{}/{}", run.pr_id, run.prompt, run.started_at)
@@ -352,6 +365,7 @@ impl App {
             (self.detail, self.lines, self.scroll) = (None, None, 0);
             (self.wt, self.cursor) = (None, 0);
             self.runs = self.st.db.runs(&key.0).unwrap_or_default();
+            self.load_tickets();
         }
         let (st, tx, id) = (self.st.clone(), self.tx.clone(), key.0.clone());
         self.detail_key = Some(key);
@@ -432,10 +446,31 @@ impl App {
         self.pr().map(bot_reviews).unwrap_or_default()
     }
 
+    /// Re-reads the selected PR's tickets: the sync may have fetched them since.
+    fn load_tickets(&mut self) {
+        let keys: Vec<String> = self.selected().map_or(Vec::new(), |p| {
+            p.jira.iter().map(|t| t.key.clone()).collect()
+        });
+        self.tickets = if keys.is_empty() {
+            Vec::new()
+        } else {
+            self.st.db.tickets(&keys).unwrap_or_default()
+        };
+        self.lines = None;
+    }
+
+    /// The ticket the Jira tab shows.
+    fn ticket(&self) -> Option<&Ticket> {
+        let picked = self.tickets.iter().find(|t| t.key == self.ticket_key);
+        picked.or(self.tickets.first())
+    }
+
     fn tab_names(&self) -> Vec<String> {
+        let jira = (!self.tickets.is_empty()).then(|| JIRA_TAB.to_string());
         let bots = self.bots().into_iter().map(|b| format!("<{}>", b.bot));
         let prompts = self.prompts().into_iter().map(|p| p.name);
         std::iter::once(String::new())
+            .chain(jira)
             .chain(bots)
             .chain(prompts)
             .collect()
@@ -768,6 +803,15 @@ impl App {
                 None => {}
             },
             (KeyCode::Char('?'), _) => self.mode = Mode::Help,
+            (KeyCode::Char(c @ ('{' | '}')), _) if self.tab() == JIRA_TAB => {
+                let keys: Vec<&str> = self.tickets.iter().map(|t| t.key.as_str()).collect();
+                let at = self
+                    .ticket()
+                    .and_then(|t| keys.iter().position(|k| *k == t.key));
+                let step = if c == '}' { 1 } else { keys.len() - 1 };
+                self.ticket_key = keys[(at.unwrap_or(0) + step) % keys.len()].to_string();
+                self.scroll = 0;
+            }
             (KeyCode::Char('['), _) => self.switch_tab(-1),
             (KeyCode::Char(']'), _) => self.switch_tab(1),
             (KeyCode::Char('w'), _) => self.worktree(0),
@@ -856,7 +900,10 @@ impl App {
                 }
             }
             Msg::Input(_) | Msg::Tick => {}
-            Msg::Core(Event::Changed) => self.reload(),
+            Msg::Core(Event::Changed) => {
+                self.reload();
+                self.load_tickets();
+            }
             Msg::Core(Event::Status) => self.status = self.st.status.lock().unwrap().clone(),
             Msg::Core(Event::PrUpdated { id, detail }) => self.set_detail(id, detail),
             Msg::Core(Event::RunUpdated(id)) => {
@@ -1207,11 +1254,24 @@ impl App {
             f.render_widget(para, area);
             return;
         }
-        if self.lines.as_ref().is_none_or(|(w, _)| *w != inner.width) {
-            let lines = pr::lines(detail, inner.width as usize, now_ms());
-            self.lines = Some((inner.width, lines));
+        let (width, now) = (inner.width as usize, now_ms());
+        let ticket = self.ticket().filter(|_| self.tab() == JIRA_TAB);
+        let shows = ticket.map(|t| t.key.clone()).unwrap_or_default();
+        if self
+            .lines
+            .as_ref()
+            .is_none_or(|(s, w, _)| *s != shows || *w != inner.width)
+        {
+            let lines = match ticket {
+                Some(t) => {
+                    let keys: Vec<String> = self.tickets.iter().map(|t| t.key.clone()).collect();
+                    pr::jira_lines(t, &keys, width, now)
+                }
+                None => pr::lines(detail, width, now),
+            };
+            self.lines = Some((shows, inner.width, lines));
         }
-        let lines = self.lines.as_ref().unwrap().1.clone();
+        let lines = self.lines.as_ref().unwrap().2.clone();
         self.pane_lines = lines.len();
         let para = Paragraph::new(lines)
             .block(block)
@@ -1377,6 +1437,8 @@ fn main() -> anyhow::Result<()> {
         detail_key: None,
         detail: None,
         lines: None,
+        tickets: Vec::new(),
+        ticket_key: String::new(),
         scroll: 0,
         pane_height: 0,
         pending_g: false,
