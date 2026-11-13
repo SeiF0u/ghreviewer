@@ -5,12 +5,13 @@ mod run;
 
 use ghreviewer_core::{
     self as backend, AppState, Event, FIX, Status, Target,
+    agent::Finding,
     agent::{Run, RunStatus},
     config::Prompt,
     err,
     inbox::{
-        PrRow, by_next, can_approve, can_wait, matches_filter, parse_ms, picked_by_default,
-        rel_time, stack_leads, stack_rows,
+        BotReview, PrRow, bot_reviews, by_next, can_approve, can_wait, matches_filter, parse_ms,
+        picked_by_default, rel_time, stack_leads, stack_rows,
     },
     local::Worktree,
     sync::PrSummary,
@@ -356,10 +357,53 @@ impl App {
         self.runs.iter().find(|r| r.prompt == self.tab_name)
     }
 
-    fn picked(&self, run: &Run) -> Vec<bool> {
-        let findings = run.review.as_ref().map_or(&[][..], |r| &r.findings[..]);
+    /// Review bots' open threads on the PR, a tab each (named `<bot>`).
+    fn bots(&self) -> Vec<BotReview> {
+        self.pr().map(bot_reviews).unwrap_or_default()
+    }
+
+    fn tab_names(&self) -> Vec<String> {
+        let bots = self.bots().into_iter().map(|b| format!("<{}>", b.bot));
+        let prompts = self.prompts().into_iter().map(|p| p.name);
+        std::iter::once(String::new())
+            .chain(bots)
+            .chain(prompts)
+            .collect()
+    }
+
+    /// The tab on screen: the PR tab when the one you were on isn't here (like the fix tab
+    /// before it ran on this PR).
+    fn tab(&self) -> String {
+        let names = self.tab_names();
+        names
+            .into_iter()
+            .find(|n| *n == self.tab_name)
+            .unwrap_or_default()
+    }
+
+    fn tab_bot(&self) -> Option<BotReview> {
+        self.bots()
+            .into_iter()
+            .find(|b| format!("<{}>", b.bot) == self.tab_name)
+    }
+
+    /// The tab's findings, with the key their picks are kept under: a bot's open threads, or the
+    /// review of the tab's run.
+    fn tab_review(&self) -> Option<(String, Vec<Finding>)> {
+        if let Some(bot) = self.tab_bot() {
+            let id = self.pr()?["id"].as_str()?;
+            return Some((format!("{id}/{}", bot.key), bot.findings));
+        }
+        let run = self.tab_run()?;
+        Some((review_key(run), run.review.as_ref()?.findings.clone()))
+    }
+
+    fn picked(&self) -> Vec<bool> {
+        let Some((key, findings)) = self.tab_review() else {
+            return Vec::new();
+        };
         self.picks
-            .get(&review_key(run))
+            .get(&key)
             .cloned()
             .unwrap_or_else(|| findings.iter().map(picked_by_default).collect())
     }
@@ -367,15 +411,16 @@ impl App {
     /// Whether the tab's findings can be picked: to post, or to fix.
     fn pickable(&self) -> bool {
         let can_fix = self.st.cfg.read().unwrap().fix.is_some();
-        self.tab_run()
+        let unposted = self
+            .tab_run()
             .and_then(|r| r.review.as_ref())
-            .is_some_and(|r| !r.findings.is_empty() && (r.posted.is_none() || can_fix))
+            .is_some_and(|r| r.posted.is_none());
+        let has = self.tab_review().is_some_and(|(_, f)| !f.is_empty());
+        has && (can_fix || unposted || self.tab_bot().is_some())
     }
 
     fn switch_tab(&mut self, delta: isize) {
-        let names: Vec<String> = std::iter::once(String::new())
-            .chain(self.prompts().into_iter().map(|p| p.name))
-            .collect();
+        let names = self.tab_names();
         let at = names.iter().position(|n| *n == self.tab_name).unwrap_or(0) as isize;
         let len = names.len() as isize;
         self.tab_name = names[((at + delta) % len + len) as usize % names.len()].clone();
@@ -422,7 +467,7 @@ impl App {
     fn post(&mut self, approve: bool) {
         let Some(run) = self.tab_run() else { return };
         let picked: Vec<usize> = self
-            .picked(run)
+            .picked()
             .iter()
             .enumerate()
             .filter(|(_, p)| **p)
@@ -435,12 +480,12 @@ impl App {
     }
 
     fn fix(&mut self) {
-        let (Some(run), Some(target)) = (self.tab_run(), self.pr().and_then(Target::from_detail))
+        let (Some((_, findings)), Some(target)) =
+            (self.tab_review(), self.pr().and_then(Target::from_detail))
         else {
             return;
         };
-        let findings = run.review.as_ref().map_or(&[][..], |r| &r.findings[..]);
-        let picked = self.picked(run);
+        let picked = self.picked();
         let findings: Vec<_> = findings
             .iter()
             .zip(picked)
@@ -654,7 +699,7 @@ impl App {
                     self.mode = Mode::Opener;
                 }
             }
-            (KeyCode::Char('a'), _) if self.tab_prompt().is_none() => {
+            (KeyCode::Char('a'), _) if self.tab().is_empty() => {
                 let viewer = self.status.viewer.as_deref();
                 if self.pr().is_some_and(|p| can_approve(p, viewer)) {
                     (self.mode, self.input) = (Mode::Approve, String::new());
@@ -665,17 +710,15 @@ impl App {
                     .tab_run()
                     .and_then(|r| r.review.as_ref())
                     .is_some_and(|r| r.posted.is_none());
-                let any = self
-                    .tab_run()
-                    .is_some_and(|r| self.picked(r).contains(&true));
+                let any = self.picked().contains(&true);
                 let approve = k.code == KeyCode::Char('a');
                 if unposted && (approve || any) {
                     self.mode = Mode::Post { approve };
                 }
             }
             (KeyCode::Char(' '), _) if self.pickable() => {
-                let run = self.tab_run().unwrap();
-                let (key, mut picked) = (review_key(run), self.picked(run));
+                let (key, _) = self.tab_review().unwrap();
+                let mut picked = self.picked();
                 if let Some(p) = picked.get_mut(self.cursor) {
                     *p = !*p;
                 }
@@ -724,8 +767,7 @@ impl App {
     }
 
     fn findings_len(&self) -> usize {
-        let review = self.tab_run().and_then(|r| r.review.as_ref());
-        review.map_or(0, |r| r.findings.len())
+        self.tab_review().map_or(0, |(_, f)| f.len())
     }
 
     fn update(&mut self, msg: Msg) -> bool {
@@ -937,10 +979,8 @@ impl App {
         let head_oid = self.pr().and_then(|p| p["headRefOid"].as_str());
         let mut tabs = vec![Span::raw(" ")];
         // The PR tab shows when the tab's prompt isn't here (like the fix tab before it ran).
-        let active = self.tab_prompt().map(|p| p.name).unwrap_or_default();
-        let names =
-            std::iter::once(String::new()).chain(self.prompts().into_iter().map(|p| p.name));
-        for (i, name) in names.enumerate() {
+        let active = self.tab();
+        for (i, name) in self.tab_names().into_iter().enumerate() {
             if i > 0 {
                 tabs.push(Span::styled(" │ ", DIM));
             }
@@ -961,16 +1001,18 @@ impl App {
                 _ if stale => Span::styled(" *", WARN),
                 _ => Span::raw(""),
             };
-            tabs.push(Span::styled(
-                if name.is_empty() { "PR".into() } else { name },
-                style,
-            ));
+            let label = match name.as_str() {
+                "" => "PR".to_string(),
+                bot if bot.starts_with('<') => bot.trim_matches(['<', '>']).to_string(),
+                _ => name,
+            };
+            tabs.push(Span::styled(label, style));
             tabs.push(mark);
         }
         tabs.push(Span::raw(" "));
         let mut right = vec![];
         let viewer = self.status.viewer.as_deref();
-        if self.tab_prompt().is_none() && self.pr().is_some_and(|p| can_approve(p, viewer)) {
+        if self.tab().is_empty() && self.pr().is_some_and(|p| can_approve(p, viewer)) {
             right.push(Span::styled(" a approve ", ACCENT));
         }
         match &self.wt {
@@ -1015,10 +1057,20 @@ impl App {
             f.render_widget(Paragraph::new(Line::styled(text, DIM)).block(block), area);
             return;
         };
-        if let Some(prompt) = self.tab_prompt() {
+        let can_fix = self.st.cfg.read().unwrap().fix.is_some();
+        let bot_view = self.tab_bot().map(|bot| {
+            run::bot_view(
+                &bot,
+                &self.picked(),
+                self.cursor,
+                can_fix,
+                inner.width as usize,
+            )
+        });
+        let prompt_view = self.tab_prompt().map(|prompt| {
             let run = self.tab_run();
             let head_oid = detail["headRefOid"].as_str();
-            let view = run::view(run::Args {
+            run::view(run::Args {
                 prompt: &prompt,
                 run,
                 stale: run.is_some_and(|r| {
@@ -1027,12 +1079,14 @@ impl App {
                         && r.head_oid.as_deref() != head_oid
                 }),
                 has_worktree: self.wt.as_ref().is_some_and(|w| w.path.is_some()),
-                picked: &run.map(|r| self.picked(r)).unwrap_or_default(),
+                picked: &self.picked(),
                 cursor: self.cursor,
-                can_fix: self.st.cfg.read().unwrap().fix.is_some(),
+                can_fix,
                 width: inner.width as usize,
                 now: now_ms(),
-            });
+            })
+        });
+        if let Some(view) = bot_view.or(prompt_view) {
             self.pane_lines = view.lines.len();
             if std::mem::take(&mut self.follow)
                 && let Some(&at) = view.findings.get(self.cursor)
@@ -1114,7 +1168,7 @@ impl App {
             Mode::Post { approve } => {
                 let n = self
                     .tab_run()
-                    .map_or(0, |r| self.picked(r).iter().filter(|p| **p).count());
+                    .map_or(0, |_| self.picked().iter().filter(|p| **p).count());
                 let what = match (approve, n) {
                     (true, 0) => "approve".to_string(),
                     (true, n) => format!("approve with {n} comments"),

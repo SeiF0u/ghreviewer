@@ -2,9 +2,9 @@
 
 use crate::pr::{ACCENT, DIM, FAIL, OK, WARN};
 use ghreviewer_core::{
-    agent::{Run, RunStatus},
+    agent::{Finding, Run, RunStatus},
     config::Prompt,
-    inbox::rel_time,
+    inbox::{BotReview, rel_time},
 };
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -72,6 +72,95 @@ fn severity_color(severity: &str) -> Color {
         Some("should-fix" | "P1") => WARN,
         _ => DIM,
     }
+}
+
+/// Findings to pick, added to `lines`; returns the line where each one starts.
+fn finding_lines(
+    lines: &mut Vec<Line<'static>>,
+    findings: &[Finding],
+    picked: &[bool],
+    cursor: usize,
+    width: usize,
+) -> Vec<usize> {
+    let mut starts = Vec::new();
+    for (i, f) in findings.iter().enumerate() {
+        lines.push(Line::raw(""));
+        starts.push(lines.len());
+        let on = picked.get(i).copied().unwrap_or(false);
+        let style = if on {
+            Style::new()
+        } else {
+            Style::new().fg(DIM)
+        };
+        let severity = if f.severity.is_empty() {
+            "note"
+        } else {
+            &f.severity
+        };
+        let head = format!("{} {} ", if on { "[x]" } else { "[ ]" }, severity);
+        // The title on the head line, wrapped under it when long.
+        let room = width.saturating_sub(2 + head.chars().count());
+        let mut title = wrap(&f.title, room).into_iter();
+        let mut first = Line::from(vec![
+            Span::styled(if i == cursor { "▸ " } else { "  " }, ACCENT),
+            Span::raw(head.clone()).patch_style(severity_color(severity)),
+            Span::styled(title.next().unwrap_or_default(), Modifier::BOLD),
+        ])
+        .style(style);
+        if i == cursor {
+            first = first.patch_style(Style::new().bg(Color::Indexed(236)));
+        }
+        lines.push(first);
+        let indent = " ".repeat(2 + head.chars().count());
+        for rest in title {
+            lines.push(Line::styled(
+                format!("{indent}{rest}"),
+                style.add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(path) = &f.path {
+            let line = f.line.map(|l| format!(":{l}")).unwrap_or_default();
+            for l in wrap(&format!("{path}{line}"), width.saturating_sub(4)) {
+                lines.push(Line::styled(format!("    {l}"), DIM));
+            }
+        }
+        for l in wrap(&f.body, width.saturating_sub(4)) {
+            lines.push(Line::styled(format!("    {l}"), style));
+        }
+    }
+    starts
+}
+
+/// A review bot's open threads on the PR, to pick and hand to the fix agent.
+pub fn bot_view(
+    bot: &BotReview,
+    picked: &[bool],
+    cursor: usize,
+    can_fix: bool,
+    width: usize,
+) -> View {
+    let n = picked.iter().filter(|p| **p).count();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(bot.bot.clone(), Modifier::BOLD),
+            Span::styled(" open review threads", DIM),
+        ]),
+        Line::styled(
+            format!("Findings · {n}/{} picked", bot.findings.len()),
+            ACCENT,
+        ),
+    ];
+    let actions = if can_fix {
+        vec![format!("f fix ({n})"), "j/k Space pick".into()]
+    } else {
+        vec!["add [fix] to the config to fix these".into()]
+    };
+    lines.extend(pieces(
+        actions.into_iter().map(|t| Span::styled(t, DIM)).collect(),
+        width,
+    ));
+    let findings = finding_lines(&mut lines, &bot.findings, picked, cursor, width);
+    View { lines, findings }
 }
 
 /// What a prompt tab shows, and the line where each finding starts (to scroll to the cursor).
@@ -199,46 +288,7 @@ pub fn view(a: Args) -> View {
             lines.push(Line::raw(""));
             text(&mut lines, &review.summary, Style::new());
         }
-        for (i, f) in review.findings.iter().enumerate() {
-            findings.push(lines.len() + 1);
-            lines.push(Line::raw(""));
-            let on = a.picked.get(i).copied().unwrap_or(false);
-            let cursor = i == a.cursor;
-            let mut head = vec![
-                Span::styled(if cursor { "▸ " } else { "  " }, ACCENT),
-                Span::raw(if on { "[x] " } else { "[ ] " }),
-                Span::styled(
-                    format!(
-                        "{} ",
-                        if f.severity.is_empty() {
-                            "note"
-                        } else {
-                            &f.severity
-                        }
-                    ),
-                    severity_color(&f.severity),
-                ),
-                Span::styled(f.title.clone(), Modifier::BOLD),
-            ];
-            if let Some(path) = &f.path {
-                let line = f.line.map(|l| format!(":{l}")).unwrap_or_default();
-                head.push(Span::styled(format!(" {path}{line}"), DIM));
-            }
-            let style = if on {
-                Style::new()
-            } else {
-                Style::new().fg(DIM)
-            };
-            let head = Line::from(head).style(if cursor {
-                style.bg(Color::Indexed(236))
-            } else {
-                style
-            });
-            lines.push(head);
-            for l in wrap(&f.body, a.width.saturating_sub(4)) {
-                lines.push(Line::styled(format!("    {l}"), style));
-            }
-        }
+        findings = finding_lines(&mut lines, &review.findings, a.picked, a.cursor, a.width);
     }
 
     if !run.output.is_empty() {

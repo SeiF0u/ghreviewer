@@ -190,6 +190,131 @@ pub fn can_approve(pr: &Value, viewer: Option<&str>) -> bool {
     !mine.is_some_and(|r| r["state"] == "APPROVED" && r["commit"]["oid"] == pr["headRefOid"])
 }
 
+/// Review bots by GitHub login, and the name of their tab.
+const BOTS: [(&str, &str); 2] = [
+    ("greptile-apps", "greptile"),
+    ("coderabbitai", "coderabbit"),
+];
+
+/// A bot's open review threads on a PR, as findings to pick; `key` changes with the threads.
+#[derive(Debug, Clone)]
+pub struct BotReview {
+    pub bot: String,
+    pub key: String,
+    pub findings: Vec<Finding>,
+}
+
+/// The first `open…close` in `text` with something in between on one line: (whole, inner).
+fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<(usize, &'a str, &'a str)> {
+    let mut from = 0;
+    while let Some(at) = text[from..].find(open).map(|i| from + i) {
+        let inner = &text[at + open.len()..];
+        if let Some(end) = inner.find(close)
+            && end > 0
+            && !inner[..end].contains('\n')
+        {
+            return Some((
+                at,
+                &text[at..at + open.len() + end + close.len()],
+                &inner[..end],
+            ));
+        }
+        from = at + open.len();
+    }
+    None
+}
+
+/// Greptile's badge, `<img alt="P1" ...>`.
+fn badge(text: &str) -> Option<&str> {
+    text.match_indices("alt=\"P").find_map(|(at, m)| {
+        let rest = &text[at + m.len()..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        (digits > 0 && rest[digits..].starts_with('"')).then(|| &text[at + 5..at + 6 + digits])
+    })
+}
+
+/// Review bots' open threads on a PR detail, one review per bot, like `botReviews` in model.ts.
+pub fn bot_reviews(pr: &Value) -> Vec<BotReview> {
+    let mut out: Vec<BotReview> = Vec::new();
+    let threads = pr["reviewThreads"]["nodes"].as_array();
+    for t in threads.into_iter().flatten() {
+        let c = &t["comments"]["nodes"][0];
+        let login = c["author"]["login"].as_str().unwrap_or_default();
+        let Some((_, bot)) = BOTS.iter().find(|(l, _)| *l == login) else {
+            continue;
+        };
+        if t.is_null() || c.is_null() || t["isResolved"] == true {
+            continue;
+        }
+        let html = c["bodyHTML"].as_str().unwrap_or_default();
+        let text = c["body"].as_str().unwrap_or(html);
+        let title = [
+            between(text, "**", "**"),
+            between(text, "<strong>", "</strong>"),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(at, _, _)| *at);
+        let severity = badge(text).unwrap_or_default();
+        // Without the title and the bot's HTML badges and links.
+        let body = match c["body"].as_str() {
+            None => html.to_string(),
+            Some(body) => paragraphs(body)
+                .into_iter()
+                .filter(|p| !title.is_some_and(|(_, whole, _)| p.contains(whole)))
+                .filter(|p| !p.trim_start().starts_with('<'))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        };
+        let outdated = t["isOutdated"] == true;
+        let severity = [severity, if outdated { "outdated" } else { "" }]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let at = match out.iter().position(|r| r.bot == *bot) {
+            Some(at) => at,
+            None => {
+                out.push(BotReview {
+                    bot: bot.to_string(),
+                    key: String::new(),
+                    findings: Vec::new(),
+                });
+                out.len() - 1
+            }
+        };
+        out[at].key += t["id"].as_str().unwrap_or_default();
+        out[at].findings.push(Finding {
+            severity,
+            title: title.map_or("comment", |(_, _, inner)| inner).to_string(),
+            body,
+            path: t["path"].as_str().map(String::from),
+            line: t["line"].as_u64().or(t["originalLine"].as_u64()),
+        });
+    }
+    out
+}
+
+/// `text` cut at blank lines.
+fn paragraphs(text: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for line in text.lines() {
+        let last = out.last_mut().unwrap();
+        if line.trim().is_empty() {
+            if !last.is_empty() {
+                out.push(String::new());
+            }
+        } else {
+            if !last.is_empty() {
+                last.push('\n');
+            }
+            last.push_str(line);
+        }
+    }
+    out.retain(|p| !p.is_empty());
+    out
+}
+
 /// Findings ticked until you change it: all but nits and Greptile's lowest priority.
 pub fn picked_by_default(f: &Finding) -> bool {
     !matches!(f.severity.split(' ').next(), Some("nit" | "P2"))
@@ -459,6 +584,53 @@ mod tests {
             &pr(mine("CHANGES_REQUESTED", "h2")),
             Some("me")
         ));
+    }
+
+    #[test]
+    fn bot_reviews_turn_open_bot_threads_into_findings() {
+        use serde_json::json;
+        let body = "<a href=\"#\"><img alt=\"P1\" src=\"x\"></a> **Leaks a handle**\n\nClose it.\n\n<a href=\"y\">Fix in Cursor</a>";
+        let thread = |id: &str, login: &str, extra: Value| {
+            let mut t = json!({
+                "id": id, "path": "a.rs", "line": 3, "originalLine": 2,
+                "isResolved": false, "isOutdated": false,
+                "comments": {"nodes": [{"body": body, "bodyHTML": "", "author": {"login": login}}]},
+            });
+            t.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            t
+        };
+        let pr = json!({"reviewThreads": {"nodes": [
+            thread("1", "greptile-apps", json!({})),
+            thread("2", "greptile-apps", json!({"isResolved": true})),
+            thread("3", "bob", json!({})),
+            thread("4", "greptile-apps", json!({"isOutdated": true, "line": null})),
+        ]}});
+        let reviews = bot_reviews(&pr);
+        assert_eq!(reviews.len(), 1);
+        let r = &reviews[0];
+        assert_eq!((r.bot.as_str(), r.key.as_str()), ("greptile", "14"));
+        let f = &r.findings[0];
+        assert_eq!(
+            (f.severity.as_str(), f.title.as_str(), f.body.as_str()),
+            ("P1", "Leaks a handle", "Close it.")
+        );
+        assert_eq!((f.path.as_deref(), f.line), (Some("a.rs"), Some(3)));
+        assert_eq!(r.findings[1].severity, "P1 outdated");
+        assert_eq!(r.findings[1].line, Some(2));
+        assert!(picked_by_default(&r.findings[1]));
+        // A title in HTML, a comment without one.
+        assert_eq!(
+            between("x <strong>T</strong>", "<strong>", "</strong>")
+                .unwrap()
+                .2,
+            "T"
+        );
+        assert_eq!(between("** **", "**", "**").unwrap().2, " ");
+        assert_eq!(between("**\n**", "**", "**"), None);
+        assert_eq!(badge(r#"<img alt="P12">"#), Some("P12"));
+        assert_eq!(badge(r#"alt="Pix""#), None);
     }
 
     #[test]

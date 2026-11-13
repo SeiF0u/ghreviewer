@@ -278,7 +278,7 @@ mise run fmt    # cargo fmt + oxfmt
 
 ### Terminal UI (experimental)
 
-`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox, the PR, prompt runs and their findings (pick, post, fix), approving and worktrees; not yet the repo sidebar, the Jira and review-bot tabs, or images. `?` lists the keys.
+`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox, the PR, review bots' open threads, prompt runs and their findings (pick, post, fix), approving and worktrees; not yet the repo sidebar, the Jira tab, or images. `?` lists the keys.
 
 ```sh
 cd src-tauri && cargo run -p ghreviewer-tui
