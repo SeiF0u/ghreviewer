@@ -1,12 +1,18 @@
 //! ghreviewer in a terminal: the inbox and the PR, over the same core as the desktop app.
 
 mod pr;
+mod run;
 
 use ghreviewer_core::{
-    self as backend, AppState, Event, Status, err,
+    self as backend, AppState, Event, FIX, Status, Target,
+    agent::{Run, RunStatus},
+    config::Prompt,
+    err,
     inbox::{
-        PrRow, by_next, can_wait, matches_filter, parse_ms, rel_time, stack_leads, stack_rows,
+        PrRow, by_next, can_approve, can_wait, matches_filter, parse_ms, picked_by_default,
+        rel_time, stack_leads, stack_rows,
     },
+    local::Worktree,
     sync::PrSummary,
 };
 use pr::{ACCENT, DIM, FAIL, OK, WARN, check_glyph, review_label};
@@ -16,10 +22,11 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     io::Write,
     sync::{Arc, mpsc},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,6 +36,10 @@ enum Msg {
     Input(Input),
     Core(Event),
     Detail(String, Result<Value, String>),
+    /// The worktree of a PR (by id).
+    Worktree(String, Result<Worktree, String>),
+    /// An action finished: what to say when it worked.
+    Done(String, Result<(), String>),
     Tick,
 }
 
@@ -37,7 +48,53 @@ enum Mode {
     Normal,
     Filter,
     Snooze,
+    /// Typing the approval's message.
+    Approve,
+    /// Asking before posting the tab's review: approving or commenting.
+    Post {
+        approve: bool,
+    },
+    /// Picking an `open_with` entry for the worktree.
+    Opener,
+    Help,
 }
+
+const HELP: &[(&str, &str)] = &[
+    (
+        "j / k, gg / G",
+        "next / previous (findings in a prompt tab), top / bottom",
+    ),
+    ("Tab, h / l, Enter", "inbox / PR pane"),
+    ("Ctrl-d / Ctrl-u", "scroll the PR pane half a page"),
+    ("[ / ]", "previous / next tab: the PR, then each prompt"),
+    ("/", "filter the inbox; Esc clears it"),
+    ("t", "next rule (all, then each rule)"),
+    ("o", "open the PR in the browser (over SSH: copy its link)"),
+    ("u", "toggle unread"),
+    (
+        "z",
+        "snooze under \"can wait\" for 1, 3 or 7 days, or wake it",
+    ),
+    (
+        "a",
+        "approve, with an optional message (PR tab); post approving (prompt tab)",
+    ),
+    (
+        "w / W",
+        "open the worktree (first open_with / pick one), or create it",
+    ),
+    (
+        "r",
+        "run or re-run the tab's prompt (creates the worktree first)",
+    ),
+    ("X", "cancel the tab's run"),
+    ("c", "continue the tab's agent session in a terminal"),
+    ("Space", "pick a finding"),
+    ("p", "post the picked findings as a review"),
+    ("f", "send the picked findings to the [fix] agent"),
+    ("Ctrl-r", "sync now"),
+    ("q, Ctrl-c", "quit"),
+];
 
 struct App {
     st: Arc<AppState>,
@@ -69,6 +126,25 @@ struct App {
     pane_height: u16,
     pending_g: bool,
     flash: Option<(String, Color)>,
+    /// Tab of the PR pane: "" for the PR, or a prompt name. Kept across PRs.
+    tab_name: String,
+    /// Latest run of each prompt on the selected PR.
+    runs: Vec<Run>,
+    wt: Option<Worktree>,
+    creating_wt: bool,
+    /// Picked findings by run (`review_key`), until you quit.
+    picks: HashMap<String, Vec<bool>>,
+    cursor: usize,
+    /// Scroll the findings cursor into view on the next draw.
+    follow: bool,
+    /// Lines in the PR pane, to stop scrolling past them.
+    pane_lines: usize,
+    /// The approval's message being typed.
+    input: String,
+}
+
+fn review_key(run: &Run) -> String {
+    format!("{}/{}/{}", run.pr_id, run.prompt, run.started_at)
 }
 
 fn now_ms() -> u64 {
@@ -203,6 +279,8 @@ impl App {
         }
         if self.detail.as_ref().is_none_or(|(id, _)| *id != key.0) {
             (self.detail, self.lines, self.scroll) = (None, None, 0);
+            (self.wt, self.cursor) = (None, 0);
+            self.runs = self.st.db.runs(&key.0).unwrap_or_default();
         }
         let (st, tx, id) = (self.st.clone(), self.tx.clone(), key.0.clone());
         self.detail_key = Some(key);
@@ -216,7 +294,164 @@ impl App {
         if self.selected().is_some_and(|p| p.id == id) {
             self.detail = Some((id, detail));
             self.lines = None;
+            self.load_wt();
         }
+    }
+
+    /// The detail of the selected PR, once loaded.
+    fn pr(&self) -> Option<&Value> {
+        let (id, detail) = self.detail.as_ref()?;
+        self.selected().filter(|p| p.id == *id).map(|_| detail)
+    }
+
+    /// Looks up the PR branch's worktree: cheap (`git worktree list`), so done on every change.
+    fn load_wt(&self) {
+        let Some(pr) = self.pr() else { return };
+        let id = pr["id"].as_str().unwrap_or_default().to_string();
+        let repo = pr["repository"]["nameWithOwner"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let branch = pr["headRefName"].as_str().unwrap_or_default().to_string();
+        let (st, tx) = (self.st.clone(), self.tx.clone());
+        self.rt.spawn(async move {
+            let res = backend::get_worktree(&st, &repo, &branch)
+                .await
+                .map_err(err);
+            let _ = tx.send(Msg::Worktree(id, res));
+        });
+    }
+
+    /// Runs `fut` in the background; `done` is what to say when it worked.
+    fn spawn(&self, done: &str, fut: impl Future<Output = anyhow::Result<()>> + Send + 'static) {
+        let (tx, done) = (self.tx.clone(), done.to_string());
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Done(done, fut.await.map_err(err)));
+        });
+    }
+
+    /// The prompt tabs: the config's prompts, and the fix agent once it ran on the PR.
+    fn prompts(&self) -> Vec<Prompt> {
+        let cfg = self.st.cfg.read().unwrap();
+        let mut prompts = cfg.prompts.clone();
+        if let Some(fix) = &cfg.fix
+            && self.runs.iter().any(|r| r.prompt == FIX)
+        {
+            prompts.push(Prompt {
+                name: FIX.into(),
+                harness: fix.harness,
+                prompt: fix.prompt.clone(),
+                args: fix.args.clone(),
+            });
+        }
+        prompts
+    }
+
+    /// The tab's prompt, `None` on the PR tab (or when the prompt left the config).
+    fn tab_prompt(&self) -> Option<Prompt> {
+        self.prompts().into_iter().find(|p| p.name == self.tab_name)
+    }
+
+    fn tab_run(&self) -> Option<&Run> {
+        self.runs.iter().find(|r| r.prompt == self.tab_name)
+    }
+
+    fn picked(&self, run: &Run) -> Vec<bool> {
+        let findings = run.review.as_ref().map_or(&[][..], |r| &r.findings[..]);
+        self.picks
+            .get(&review_key(run))
+            .cloned()
+            .unwrap_or_else(|| findings.iter().map(picked_by_default).collect())
+    }
+
+    /// Whether the tab's findings can be picked: to post, or to fix.
+    fn pickable(&self) -> bool {
+        let can_fix = self.st.cfg.read().unwrap().fix.is_some();
+        self.tab_run()
+            .and_then(|r| r.review.as_ref())
+            .is_some_and(|r| !r.findings.is_empty() && (r.posted.is_none() || can_fix))
+    }
+
+    fn switch_tab(&mut self, delta: isize) {
+        let names: Vec<String> = std::iter::once(String::new())
+            .chain(self.prompts().into_iter().map(|p| p.name))
+            .collect();
+        let at = names.iter().position(|n| *n == self.tab_name).unwrap_or(0) as isize;
+        let len = names.len() as isize;
+        self.tab_name = names[((at + delta) % len + len) as usize % names.len()].clone();
+        (self.scroll, self.cursor) = (0, 0);
+    }
+
+    /// A finished run counts as read once its tab is on screen.
+    fn mark_seen(&mut self) {
+        let Some(run) = self.tab_run() else { return };
+        if self.pr().is_some() && !run.seen && run.status != RunStatus::Running {
+            let res = backend::mark_run_seen(&self.st, &run.pr_id.clone(), &run.prompt.clone());
+            self.say(res);
+        }
+    }
+
+    fn worktree(&mut self, opener: usize) {
+        let (Some(wt), Some(pr)) = (&self.wt, self.selected()) else {
+            return;
+        };
+        let (repo, number) = (pr.repo.clone(), pr.number);
+        let st = self.st.clone();
+        if let Some(path) = wt.path.clone() {
+            let branch = self
+                .pr()
+                .and_then(|p| p["headRefName"].as_str())
+                .unwrap_or_default();
+            let branch = branch.to_string();
+            self.spawn("", async move {
+                backend::open_worktree(&st, opener, &path, &repo, &branch, number).await
+            });
+        } else if wt.clone.is_some() && wt.wt && !self.creating_wt {
+            self.creating_wt = true;
+            self.spawn("worktree created", async move {
+                backend::create_worktree(&st, &repo, number).await
+            });
+        } else if wt.clone.is_none() {
+            self.flash = Some((format!("no clone of {repo} under clone_roots"), FAIL));
+        } else if !wt.wt {
+            self.flash = Some(("creating worktrees needs worktrunk (wt)".into(), FAIL));
+        }
+    }
+
+    /// Posts the tab run's picked findings as one review.
+    fn post(&mut self, approve: bool) {
+        let Some(run) = self.tab_run() else { return };
+        let picked: Vec<usize> = self
+            .picked(run)
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p)
+            .map(|(i, _)| i)
+            .collect();
+        let (st, pr_id, prompt) = (self.st.clone(), run.pr_id.clone(), run.prompt.clone());
+        self.spawn("review posted", async move {
+            backend::post_review(&st, &pr_id, &prompt, &picked, approve).await
+        });
+    }
+
+    fn fix(&mut self) {
+        let (Some(run), Some(target)) = (self.tab_run(), self.pr().and_then(Target::from_detail))
+        else {
+            return;
+        };
+        let findings = run.review.as_ref().map_or(&[][..], |r| &r.findings[..]);
+        let picked = self.picked(run);
+        let findings: Vec<_> = findings
+            .iter()
+            .zip(picked)
+            .filter(|(_, p)| *p)
+            .map(|(f, _)| f.clone())
+            .collect();
+        let res = backend::fix_findings(&self.st, target, &findings);
+        if res.is_ok() {
+            (self.tab_name, self.scroll) = (FIX.into(), 0);
+        }
+        self.say(res);
     }
 
     /// Moves the selection, picking the PR you land on (and so marking it read).
@@ -236,7 +471,7 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: i32) {
-        let max = self.lines.as_ref().map_or(0, |(_, l)| l.len()) as i32;
+        let max = self.pane_lines as i32;
         self.scroll = (self.scroll as i32 + delta).clamp(0, (max - 1).max(0)) as u16;
     }
 
@@ -299,6 +534,51 @@ impl App {
                 }
                 return true;
             }
+            Mode::Approve => {
+                match k.code {
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Enter => {
+                        self.mode = Mode::Normal;
+                        let pr = self.pr();
+                        let id = pr
+                            .and_then(|p| p["id"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let oid = pr
+                            .and_then(|p| p["headRefOid"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (st, body) = (self.st.clone(), std::mem::take(&mut self.input));
+                        self.spawn("approved", async move {
+                            backend::approve_pr(&st, &id, &oid, body).await
+                        });
+                    }
+                    KeyCode::Backspace => {
+                        self.input.pop();
+                    }
+                    KeyCode::Char(c) => self.input.push(c),
+                    _ => {}
+                }
+                return true;
+            }
+            Mode::Post { approve } => {
+                self.mode = Mode::Normal;
+                if k.code == KeyCode::Char('y') {
+                    self.post(approve);
+                }
+                return true;
+            }
+            Mode::Opener => {
+                self.mode = Mode::Normal;
+                if let KeyCode::Char(c @ '1'..='9') = k.code {
+                    self.worktree(c as usize - '1' as usize);
+                }
+                return true;
+            }
+            Mode::Help => {
+                self.mode = Mode::Normal;
+                return true;
+            }
             Mode::Normal => {}
         }
         let was_g = std::mem::take(&mut self.pending_g);
@@ -310,6 +590,17 @@ impl App {
             (KeyCode::Char('u'), true) => self.scroll_by(-half),
             (KeyCode::Char('r'), true) => backend::refresh(&self.st),
             (_, true) => {}
+            // In a prompt tab, j/k step through findings; past either end they scroll again.
+            (KeyCode::Char('j') | KeyCode::Down, _)
+                if self.pr_focus && self.pickable() && self.cursor + 1 < self.findings_len() =>
+            {
+                (self.cursor, self.follow) = (self.cursor + 1, true)
+            }
+            (KeyCode::Char('k') | KeyCode::Up, _)
+                if self.pr_focus && self.pickable() && self.cursor > 0 =>
+            {
+                (self.cursor, self.follow) = (self.cursor - 1, true)
+            }
             (KeyCode::Char('j') | KeyCode::Down, _) if self.pr_focus => self.scroll_by(1),
             (KeyCode::Char('k') | KeyCode::Up, _) if self.pr_focus => self.scroll_by(-1),
             (KeyCode::Char('j') | KeyCode::Down, _) => self.go(self.sel + 1),
@@ -353,6 +644,72 @@ impl App {
                 Some(_) => self.mode = Mode::Snooze,
                 None => {}
             },
+            (KeyCode::Char('?'), _) => self.mode = Mode::Help,
+            (KeyCode::Char('['), _) => self.switch_tab(-1),
+            (KeyCode::Char(']'), _) => self.switch_tab(1),
+            (KeyCode::Char('w'), _) => self.worktree(0),
+            (KeyCode::Char('W'), _) => {
+                let openers = self.st.cfg.read().unwrap().open_with.len();
+                if self.wt.as_ref().is_some_and(|w| w.path.is_some()) && openers > 0 {
+                    self.mode = Mode::Opener;
+                }
+            }
+            (KeyCode::Char('a'), _) if self.tab_prompt().is_none() => {
+                let viewer = self.status.viewer.as_deref();
+                if self.pr().is_some_and(|p| can_approve(p, viewer)) {
+                    (self.mode, self.input) = (Mode::Approve, String::new());
+                }
+            }
+            (KeyCode::Char('a' | 'p'), _) => {
+                let unposted = self
+                    .tab_run()
+                    .and_then(|r| r.review.as_ref())
+                    .is_some_and(|r| r.posted.is_none());
+                let any = self
+                    .tab_run()
+                    .is_some_and(|r| self.picked(r).contains(&true));
+                let approve = k.code == KeyCode::Char('a');
+                if unposted && (approve || any) {
+                    self.mode = Mode::Post { approve };
+                }
+            }
+            (KeyCode::Char(' '), _) if self.pickable() => {
+                let run = self.tab_run().unwrap();
+                let (key, mut picked) = (review_key(run), self.picked(run));
+                if let Some(p) = picked.get_mut(self.cursor) {
+                    *p = !*p;
+                }
+                self.picks.insert(key, picked);
+            }
+            (KeyCode::Char('f'), _) if self.pickable() => self.fix(),
+            (KeyCode::Char('r'), _) => {
+                let target = self.pr().and_then(Target::from_detail);
+                if let (Some(p), Some(target)) = (self.tab_prompt(), target)
+                    && p.name != FIX
+                {
+                    let res = backend::run_prompt(&self.st, &p.name, target);
+                    self.say(res);
+                }
+            }
+            (KeyCode::Char('X'), _) => {
+                if let Some((id, prompt)) =
+                    self.tab_run().map(|r| (r.pr_id.clone(), r.prompt.clone()))
+                {
+                    let res = backend::cancel_run(&self.st, &id, &prompt);
+                    self.say(res);
+                }
+            }
+            (KeyCode::Char('c'), _) => {
+                if let Some((id, prompt)) =
+                    self.tab_run().map(|r| (r.pr_id.clone(), r.prompt.clone()))
+                {
+                    let st = self.st.clone();
+                    self.spawn(
+                        "",
+                        async move { backend::continue_run(&st, &id, &prompt).await },
+                    );
+                }
+            }
             (KeyCode::Char('t'), _) => {
                 let all: Vec<&str> = std::iter::once("")
                     .chain(self.rules.iter().map(String::as_str))
@@ -366,17 +723,49 @@ impl App {
         true
     }
 
+    fn findings_len(&self) -> usize {
+        let review = self.tab_run().and_then(|r| r.review.as_ref());
+        review.map_or(0, |r| r.findings.len())
+    }
+
     fn update(&mut self, msg: Msg) -> bool {
         match msg {
-            Msg::Input(Input::Key(k)) if k.kind == KeyEventKind::Press => return self.key(k),
+            Msg::Input(Input::Key(k)) if k.kind == KeyEventKind::Press => {
+                if !self.key(k) {
+                    return false;
+                }
+            }
             Msg::Input(_) | Msg::Tick => {}
             Msg::Core(Event::Changed) => self.reload(),
             Msg::Core(Event::Status) => self.status = self.st.status.lock().unwrap().clone(),
             Msg::Core(Event::PrUpdated { id, detail }) => self.set_detail(id, detail),
-            Msg::Core(_) => {}
+            Msg::Core(Event::RunUpdated(id)) => {
+                if self.selected().is_some_and(|p| p.id == id) {
+                    self.runs = self.st.db.runs(&id).unwrap_or_default();
+                }
+            }
+            Msg::Core(Event::WorktreeCreated) => self.load_wt(),
             Msg::Detail(id, Ok(detail)) => self.set_detail(id, detail),
             Msg::Detail(_, Err(e)) => self.flash = Some((e, FAIL)),
+            Msg::Worktree(id, res) => {
+                if self.selected().is_some_and(|p| p.id == id) {
+                    match res {
+                        Ok(wt) => self.wt = Some(wt),
+                        Err(e) => self.flash = Some((e, FAIL)),
+                    }
+                }
+            }
+            Msg::Done(done, res) => {
+                self.creating_wt = false;
+                self.load_wt();
+                match res {
+                    Ok(()) if done.is_empty() => {}
+                    Ok(()) => self.flash = Some((done, OK)),
+                    Err(e) => self.flash = Some((e, FAIL)),
+                }
+            }
         }
+        self.mark_seen();
         true
     }
 
@@ -390,6 +779,9 @@ impl App {
         self.draw_inbox(f, left);
         self.draw_pr(f, right);
         self.draw_bar(f, bar);
+        if self.mode == Mode::Help {
+            self.draw_help(f);
+        }
     }
 
     fn draw_inbox(&self, f: &mut Frame, area: Rect) {
@@ -540,11 +932,81 @@ impl App {
         ListItem::new(Text::from(vec![line1, Line::from(line2), line3]))
     }
 
+    /// Tab names with their run's mark, and what the keys can do on the right.
+    fn pr_titles(&self, width: usize) -> (Line<'static>, Line<'static>) {
+        let head_oid = self.pr().and_then(|p| p["headRefOid"].as_str());
+        let mut tabs = vec![Span::raw(" ")];
+        // The PR tab shows when the tab's prompt isn't here (like the fix tab before it ran).
+        let active = self.tab_prompt().map(|p| p.name).unwrap_or_default();
+        let names =
+            std::iter::once(String::new()).chain(self.prompts().into_iter().map(|p| p.name));
+        for (i, name) in names.enumerate() {
+            if i > 0 {
+                tabs.push(Span::styled(" │ ", DIM));
+            }
+            let style = if name == active {
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(DIM)
+            };
+            let run = self.runs.iter().find(|r| r.prompt == name);
+            let stale = run.is_some_and(|r| {
+                r.status != RunStatus::Running
+                    && r.head_oid.is_some()
+                    && r.head_oid.as_deref() != head_oid
+            });
+            let mark = match run.map(|r| r.status) {
+                Some(RunStatus::Running) => Span::styled(" …", WARN),
+                Some(RunStatus::Error) => Span::styled(" !", FAIL),
+                _ if stale => Span::styled(" *", WARN),
+                _ => Span::raw(""),
+            };
+            tabs.push(Span::styled(
+                if name.is_empty() { "PR".into() } else { name },
+                style,
+            ));
+            tabs.push(mark);
+        }
+        tabs.push(Span::raw(" "));
+        let mut right = vec![];
+        let viewer = self.status.viewer.as_deref();
+        if self.tab_prompt().is_none() && self.pr().is_some_and(|p| can_approve(p, viewer)) {
+            right.push(Span::styled(" a approve ", ACCENT));
+        }
+        match &self.wt {
+            _ if self.creating_wt => right.push(Span::styled(" creating worktree… ", WARN)),
+            Some(Worktree {
+                path: Some(path), ..
+            }) => {
+                // As much of the folder name as fits beside the tabs.
+                let used =
+                    Line::from(tabs.clone()).width() + right.iter().map(Span::width).sum::<usize>();
+                let room = width.saturating_sub(used + 6);
+                let name = path.rsplit('/').next().unwrap_or_default();
+                if room > 3 {
+                    right.push(Span::styled(format!(" w {} ", fit(name, room)), DIM));
+                }
+            }
+
+            Some(Worktree {
+                clone: Some(_),
+                wt: true,
+                ..
+            }) => right.push(Span::styled(" w + worktree ", DIM)),
+            _ => {}
+        }
+        (Line::from(tabs), Line::from(right).right_aligned())
+    }
+
     fn draw_pr(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::bordered().border_style(if self.pr_focus { ACCENT } else { DIM });
+        let (tabs, right) = self.pr_titles(area.width as usize);
+        let block = Block::bordered()
+            .title(tabs)
+            .title(right)
+            .border_style(if self.pr_focus { ACCENT } else { DIM });
         let inner = block.inner(area);
         self.pane_height = inner.height;
-        let Some((_, detail)) = &self.detail else {
+        let Some(detail) = self.pr() else {
             let text = if self.selected().is_some() {
                 "Loading…"
             } else {
@@ -553,16 +1015,82 @@ impl App {
             f.render_widget(Paragraph::new(Line::styled(text, DIM)).block(block), area);
             return;
         };
+        if let Some(prompt) = self.tab_prompt() {
+            let run = self.tab_run();
+            let head_oid = detail["headRefOid"].as_str();
+            let view = run::view(run::Args {
+                prompt: &prompt,
+                run,
+                stale: run.is_some_and(|r| {
+                    r.status != RunStatus::Running
+                        && r.head_oid.is_some()
+                        && r.head_oid.as_deref() != head_oid
+                }),
+                has_worktree: self.wt.as_ref().is_some_and(|w| w.path.is_some()),
+                picked: &run.map(|r| self.picked(r)).unwrap_or_default(),
+                cursor: self.cursor,
+                can_fix: self.st.cfg.read().unwrap().fix.is_some(),
+                width: inner.width as usize,
+                now: now_ms(),
+            });
+            self.pane_lines = view.lines.len();
+            if std::mem::take(&mut self.follow)
+                && let Some(&at) = view.findings.get(self.cursor)
+            {
+                let (at, h) = (at as u16, inner.height.max(4));
+                if at < self.scroll {
+                    self.scroll = at;
+                } else if at + 3 > self.scroll + h {
+                    self.scroll = at + 3 - h;
+                }
+            }
+            let para = Paragraph::new(view.lines)
+                .block(block)
+                .scroll((self.scroll, 0));
+            f.render_widget(para, area);
+            return;
+        }
         if self.lines.as_ref().is_none_or(|(w, _)| *w != inner.width) {
             let lines = pr::lines(detail, inner.width as usize, now_ms());
             self.lines = Some((inner.width, lines));
         }
         let lines = self.lines.as_ref().unwrap().1.clone();
+        self.pane_lines = lines.len();
         let para = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false })
             .scroll((self.scroll, 0));
         f.render_widget(para, area);
+    }
+
+    fn draw_help(&self, f: &mut Frame) {
+        let w = HELP.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        let lines: Vec<Line> = HELP
+            .iter()
+            .map(|(k, v)| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<w$}  "), ACCENT),
+                    Span::raw(*v),
+                ])
+            })
+            .collect();
+        let area = f.area();
+        let width = (area.width.saturating_sub(4)).min(96);
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let at = Rect::new(
+            (area.width - width) / 2,
+            (area.height - height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, at);
+        let block = Block::bordered().title(" Keys ").border_style(ACCENT);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            at,
+        );
     }
 
     fn draw_bar(&self, f: &mut Frame, area: Rect) {
@@ -577,6 +1105,41 @@ impl App {
                 Span::styled("snooze: ", ACCENT),
                 dim("1 day · 3 days · 7 a week · any key cancels".into()),
             ],
+            Mode::Approve => vec![
+                Span::styled("approve, message (optional): ", ACCENT),
+                Span::raw(self.input.clone()),
+                Span::raw("█"),
+                dim("  Enter approve · Esc cancel".into()),
+            ],
+            Mode::Post { approve } => {
+                let n = self
+                    .tab_run()
+                    .map_or(0, |r| self.picked(r).iter().filter(|p| **p).count());
+                let what = match (approve, n) {
+                    (true, 0) => "approve".to_string(),
+                    (true, n) => format!("approve with {n} comments"),
+                    (false, n) => format!("comment with {n} findings"),
+                };
+                vec![
+                    Span::styled(format!("post review: {what}? "), ACCENT),
+                    dim("y / any key cancels".into()),
+                ]
+            }
+            Mode::Opener => {
+                let cfg = self.st.cfg.read().unwrap();
+                let names: Vec<String> = cfg
+                    .open_with
+                    .iter()
+                    .take(9)
+                    .enumerate()
+                    .map(|(i, o)| format!("{} {}", i + 1, o.name))
+                    .collect();
+                vec![
+                    Span::styled("open worktree in: ", ACCENT),
+                    dim(names.join(" · ") + " · any other key cancels"),
+                ]
+            }
+            Mode::Help => vec![dim("any key closes".into())],
             Mode::Normal => {
                 let mut spans = vec![];
                 if let Some((text, color)) = &self.flash {
@@ -609,8 +1172,7 @@ impl App {
                 spans
             }
         };
-        let keys =
-            "j/k move · Tab pane · / filter · o open · u unread · z snooze · ^r sync · q quit";
+        let keys = "j/k move · Tab pane · [ ] tabs · / filter · ? keys · q quit";
         let keys_w = keys.chars().count() as u16;
         // The hints only when they leave room for the status.
         let keys_w = if area.width >= keys_w + 40 { keys_w } else { 0 };
@@ -662,14 +1224,25 @@ fn main() -> anyhow::Result<()> {
         pane_height: 0,
         pending_g: false,
         flash: None,
+        tab_name: String::new(),
+        runs: Vec::new(),
+        wt: None,
+        creating_wt: false,
+        picks: HashMap::new(),
+        cursor: 0,
+        follow: false,
+        pane_lines: 0,
+        input: String::new(),
     };
     app.reload(); // the cache shows right away, the first sync follows
     let mut term = ratatui::init();
     let res = (|| -> anyhow::Result<()> {
         loop {
             term.draw(|f| app.draw(f))?;
-            // A tick now and then keeps the relative times fresh.
-            let msg = match rx.recv_timeout(Duration::from_secs(30)) {
+            // A tick now and then keeps the relative times fresh; each second for a run's timer.
+            let running = app.runs.iter().any(|r| r.status == RunStatus::Running);
+            let tick = Duration::from_secs(if running { 1 } else { 30 });
+            let msg = match rx.recv_timeout(tick) {
                 Ok(m) => m,
                 Err(mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),

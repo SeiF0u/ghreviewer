@@ -1,6 +1,8 @@
 //! Inbox logic for the TUI, ported from `src/model.ts`: keep the two in step, with the same tests.
 
+use crate::agent::Finding;
 use crate::sync::{Next, PrSummary};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Smart inbox ranks, most urgent first.
@@ -170,6 +172,27 @@ pub fn stack_leads(all: &[PrSummary], rows: &[PrRow]) -> Vec<Option<usize>> {
         }
     }
     leads
+}
+
+/// Whether `viewer` can approve the PR detail: open, someone else's, and its head not approved by
+/// them yet. Uses their latest opinionated review: replying to a thread after approving makes a
+/// newer "commented" review that doesn't undo the approval.
+pub fn can_approve(pr: &Value, viewer: Option<&str>) -> bool {
+    let Some(viewer) = viewer else { return false };
+    if pr["state"] != "OPEN" || pr["author"]["login"] == viewer {
+        return false;
+    }
+    let reviews = pr["latestOpinionatedReviews"]["nodes"].as_array();
+    let mine = reviews
+        .into_iter()
+        .flatten()
+        .find(|r| r["author"]["login"] == viewer);
+    !mine.is_some_and(|r| r["state"] == "APPROVED" && r["commit"]["oid"] == pr["headRefOid"])
+}
+
+/// Findings ticked until you change it: all but nits and Greptile's lowest priority.
+pub fn picked_by_default(f: &Finding) -> bool {
+    !matches!(f.severity.split(' ').next(), Some("nit" | "P2"))
 }
 
 /// Milliseconds since the epoch of a GitHub timestamp (`2026-01-09T23:59:30Z`).
@@ -405,6 +428,49 @@ mod tests {
             tail_patch("x.rs", hunk, 8),
             "--- a/x.rs\n+++ b/x.rs\n@@ -10,3 +10,4 @@ fn main() {\n a\n-b\n+c\n+d\n e\n"
         );
+    }
+
+    #[test]
+    fn can_approve_open_not_mine_head_not_approved_by_me_yet() {
+        use serde_json::json;
+        let pr = |extra: Value| {
+            let mut v = json!({"state": "OPEN", "headRefOid": "h2", "author": {"login": "bob"}});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let mine = |state: &str, oid: &str| {
+            json!({"latestOpinionatedReviews": {"nodes": [
+                {"author": {"login": "me"}, "state": state, "commit": {"oid": oid}}
+            ]}})
+        };
+        assert!(can_approve(&pr(json!({})), Some("me")));
+        assert!(!can_approve(&pr(json!({})), None));
+        assert!(!can_approve(
+            &pr(json!({"author": {"login": "me"}})),
+            Some("me")
+        ));
+        assert!(!can_approve(&pr(json!({"state": "MERGED"})), Some("me")));
+        assert!(!can_approve(&pr(mine("APPROVED", "h2")), Some("me")));
+        // New commits since, or changes requested: approve again.
+        assert!(can_approve(&pr(mine("APPROVED", "h1")), Some("me")));
+        assert!(can_approve(
+            &pr(mine("CHANGES_REQUESTED", "h2")),
+            Some("me")
+        ));
+    }
+
+    #[test]
+    fn nits_and_p2_are_not_picked_by_default() {
+        let f = |severity: &str| Finding {
+            severity: severity.into(),
+            ..Default::default()
+        };
+        assert!(picked_by_default(&f("blocker")));
+        assert!(picked_by_default(&f("P1")));
+        assert!(!picked_by_default(&f("nit")));
+        assert!(!picked_by_default(&f("P2 outdated")));
     }
 
     #[test]

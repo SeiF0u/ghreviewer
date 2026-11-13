@@ -448,6 +448,22 @@ pub struct Target {
     pub head_oid: Option<String>,
 }
 
+impl Target {
+    /// From a PR detail (the GraphQL JSON of `sync.rs`), like `target` in `src/api.ts`.
+    pub fn from_detail(pr: &Value) -> Option<Self> {
+        let s = |ptr: &str| pr.pointer(ptr).and_then(Value::as_str).map(String::from);
+        Some(Target {
+            id: s("/id")?,
+            repo: s("/repository/nameWithOwner")?,
+            number: pr["number"].as_u64()?,
+            url: s("/url")?,
+            branch: s("/headRefName")?,
+            base: s("/baseRefName")?,
+            head_oid: s("/headRefOid"),
+        })
+    }
+}
+
 /// Whether the run with `token` is still the live one for `key`: not cancelled, not replaced.
 fn is_current<T>(
     running: &HashMap<(String, String), (u64, T)>,
@@ -564,7 +580,7 @@ pub fn run_prompt(st: &Arc<AppState>, prompt: &str, pr: Target) -> anyhow::Resul
 }
 
 /// Name of the fix agent's runs and tab.
-const FIX: &str = "fix";
+pub const FIX: &str = "fix";
 
 /// Hands findings picked in a review to the `[fix]` agent, as a run of the `fix` prompt.
 pub fn fix_findings(st: &Arc<AppState>, pr: Target, findings: &[Finding]) -> anyhow::Result<()> {
