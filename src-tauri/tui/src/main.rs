@@ -65,7 +65,11 @@ const HELP: &[(&str, &str)] = &[
         "j / k, gg / G",
         "next / previous (findings in a prompt tab), top / bottom",
     ),
-    ("Tab, h / l, Enter", "inbox / PR pane"),
+    ("Tab, h / l", "inbox / PR pane"),
+    (
+        "Enter",
+        "open a run listed above the inbox, or go to the PR pane",
+    ),
     ("Ctrl-d / Ctrl-u", "scroll the PR pane half a page"),
     ("[ / ]", "previous / next tab: the PR, then each prompt"),
     ("/", "filter the inbox; Esc clears it"),
@@ -142,6 +146,10 @@ struct App {
     pane_lines: usize,
     /// The approval's message being typed.
     input: String,
+    /// Runs going, or finished and not looked at yet: listed above the inbox.
+    active: Vec<Run>,
+    /// The run under the cursor, when it's in that list rather than on a PR.
+    run_sel: Option<usize>,
 }
 
 fn review_key(run: &Run) -> String {
@@ -245,7 +253,69 @@ impl App {
         if self.smart {
             by_next(&mut self.inbox);
         }
+        self.load_active();
         self.rebuild();
+    }
+
+    fn load_active(&mut self) {
+        match self.st.db.active_runs() {
+            Ok(runs) => self.active = runs,
+            Err(e) => self.flash = Some((err(e), FAIL)),
+        }
+        self.run_sel = self.run_sel.filter(|&i| i < self.active.len());
+    }
+
+    /// Down in the inbox: through the runs, then the PRs.
+    fn down(&mut self) {
+        match self.run_sel {
+            Some(i) if i + 1 < self.active.len() => self.run_sel = Some(i + 1),
+            Some(_) => {
+                self.run_sel = None;
+                self.go(0);
+            }
+            None => self.go(self.sel + 1),
+        }
+    }
+
+    fn up(&mut self) {
+        match self.run_sel {
+            Some(i) => self.run_sel = Some(i.saturating_sub(1)),
+            None if self.sel == 0 && !self.active.is_empty() => {
+                self.run_sel = Some(self.active.len() - 1)
+            }
+            None => self.go(self.sel.saturating_sub(1)),
+        }
+    }
+
+    /// Jumps from a listed run to its PR's tab, which marks it seen.
+    fn open_run(&mut self, i: usize) {
+        let Some(run) = self.active.get(i).cloned() else {
+            return;
+        };
+        self.run_sel = None;
+        let known = {
+            let cfg = self.st.cfg.read().unwrap();
+            cfg.prompts.iter().any(|p| p.name == run.prompt)
+                || (run.prompt == FIX && cfg.fix.is_some())
+        };
+        let target = self.inbox.iter().find(|p| p.id == run.pr_id && !p.context);
+        // The PR left the inbox or the prompt left the config: nothing to show, just clear it.
+        let Some(target) = target.filter(|_| known) else {
+            let res = backend::mark_run_seen(&self.st, &run.pr_id, &run.prompt);
+            return self.say(res);
+        };
+        if !matches_filter(target, &self.filter) {
+            self.filter.clear();
+        }
+        if !self.rule.is_empty() && !target.rules.contains(&self.rule) {
+            self.rule.clear();
+        }
+        self.picked = Some(run.pr_id.clone());
+        self.rebuild();
+        self.go(self.sel); // picks it, like moving onto it
+
+        (self.tab_name, self.scroll, self.cursor) = (run.prompt, 0, 0);
+        self.pr_focus = true;
     }
 
     fn rebuild(&mut self) {
@@ -648,20 +718,28 @@ impl App {
             }
             (KeyCode::Char('j') | KeyCode::Down, _) if self.pr_focus => self.scroll_by(1),
             (KeyCode::Char('k') | KeyCode::Up, _) if self.pr_focus => self.scroll_by(-1),
-            (KeyCode::Char('j') | KeyCode::Down, _) => self.go(self.sel + 1),
-            (KeyCode::Char('k') | KeyCode::Up, _) => self.go(self.sel.saturating_sub(1)),
+            (KeyCode::Char('j') | KeyCode::Down, _) => self.down(),
+            (KeyCode::Char('k') | KeyCode::Up, _) => self.up(),
             (KeyCode::Char('g'), _) if was_g => {
                 if self.pr_focus {
                     self.scroll = 0
+                } else if !self.active.is_empty() {
+                    self.run_sel = Some(0)
                 } else {
                     self.go(0)
                 }
             }
             (KeyCode::Char('g'), _) => self.pending_g = true,
             (KeyCode::Char('G'), _) if self.pr_focus => self.scroll_by(i32::MAX / 2),
-            (KeyCode::Char('G'), _) => self.go(last),
+            (KeyCode::Char('G'), _) => {
+                self.run_sel = None;
+                self.go(last)
+            }
             (KeyCode::Tab | KeyCode::BackTab, _) => self.pr_focus = !self.pr_focus,
-            (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) => self.pr_focus = true,
+            (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) => match self.run_sel {
+                Some(i) if !self.pr_focus => self.open_run(i),
+                _ => self.pr_focus = true,
+            },
             (KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc, _) if self.pr_focus => {
                 self.pr_focus = false
             }
@@ -782,6 +860,7 @@ impl App {
             Msg::Core(Event::Status) => self.status = self.st.status.lock().unwrap().clone(),
             Msg::Core(Event::PrUpdated { id, detail }) => self.set_detail(id, detail),
             Msg::Core(Event::RunUpdated(id)) => {
+                self.load_active();
                 if self.selected().is_some_and(|p| p.id == id) {
                     self.runs = self.st.db.runs(&id).unwrap_or_default();
                 }
@@ -846,8 +925,12 @@ impl App {
             .title(title)
             .border_style(if self.pr_focus { DIM } else { ACCENT });
         let width = block.inner(area).width as usize;
-        let mut items = Vec::new();
-        let mut at = None;
+        let mut items: Vec<ListItem> = self
+            .active
+            .iter()
+            .map(|r| self.run_item(r, width, now))
+            .collect();
+        let mut at = self.run_sel;
         for (i, row) in self.rows.iter().enumerate() {
             if Some(i) == self.wait_at {
                 let waiting = self.rows[i..].iter().filter(|r| !r.dim).count();
@@ -857,7 +940,7 @@ impl App {
                     DIM,
                 )));
             }
-            if i == self.sel {
+            if i == self.sel && self.run_sel.is_none() {
                 at = Some(items.len());
             }
             let later = self.wait_at.is_some_and(|w| i >= w);
@@ -869,7 +952,7 @@ impl App {
                 .filter(|&l| l != row.pr);
             items.push(self.inbox_item(row, later, lead.map(|l| &self.inbox[l]), width, now));
         }
-        if items.is_empty() {
+        if self.rows.is_empty() {
             let empty = if self.filter.is_empty() {
                 "Inbox zero."
             } else {
@@ -882,6 +965,26 @@ impl App {
             .highlight_style(Style::new().bg(Color::Indexed(236)));
         let mut state = ListState::default().with_selected(at);
         f.render_stateful_widget(list, area, &mut state);
+    }
+
+    /// A listed run: prompt and PR, its state on the right.
+    fn run_item(&self, run: &Run, width: usize, now: u64) -> ListItem<'static> {
+        let (mark, state, color) = match run.status {
+            RunStatus::Running => {
+                let secs = now.saturating_sub(run.started_at) / 1000;
+                ("▶ ", format!("{}:{:02}", secs / 60, secs % 60), WARN)
+            }
+            RunStatus::Done => ("● ", "done".into(), OK),
+            RunStatus::Error => ("! ", "failed".into(), FAIL),
+            RunStatus::Cancelled => ("● ", "cancelled".into(), DIM),
+            RunStatus::Interrupted => ("● ", "interrupted".into(), WARN),
+        };
+        let left = vec![
+            Span::styled(mark, color),
+            Span::styled(run.prompt.clone(), Modifier::BOLD),
+            Span::styled(format!(" {}#{}", run.repo, run.number), DIM),
+        ];
+        ListItem::new(spread(left, vec![Span::styled(state, color)], width))
     }
 
     fn inbox_item(
@@ -1287,6 +1390,8 @@ fn main() -> anyhow::Result<()> {
         follow: false,
         pane_lines: 0,
         input: String::new(),
+        active: Vec::new(),
+        run_sel: None,
     };
     app.reload(); // the cache shows right away, the first sync follows
     let mut term = ratatui::init();
@@ -1294,7 +1399,11 @@ fn main() -> anyhow::Result<()> {
         loop {
             term.draw(|f| app.draw(f))?;
             // A tick now and then keeps the relative times fresh; each second for a run's timer.
-            let running = app.runs.iter().any(|r| r.status == RunStatus::Running);
+            let running = app
+                .runs
+                .iter()
+                .chain(&app.active)
+                .any(|r| r.status == RunStatus::Running);
             let tick = Duration::from_secs(if running { 1 } else { 30 });
             let msg = match rx.recv_timeout(tick) {
                 Ok(m) => m,
