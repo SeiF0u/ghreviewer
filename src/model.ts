@@ -1,6 +1,6 @@
 import type { Finding, Next, PrDetail, PrSummary, Run, TicketRef } from "./api";
 
-// Inbox ranking, stacks, filtering, canApprove, pickedByDefault and botReviews have a Rust twin
+// Inbox ranking, stacks, filtering, sidebarItems, inScope, canApprove, pickedByDefault and botReviews have a Rust twin
 // for the TUI (src-tauri/core/src/inbox.rs): change both, with their tests.
 
 export type SideItem =

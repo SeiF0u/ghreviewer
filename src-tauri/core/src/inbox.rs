@@ -3,7 +3,7 @@
 use crate::agent::Finding;
 use crate::sync::{Next, PrSummary};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Smart inbox ranks, most urgent first.
 const NEXT_ORDER: [Next; 8] = [
@@ -42,6 +42,133 @@ pub fn matches_filter(pr: &PrSummary, filter: &str) -> bool {
         || format!("{}#{} {} {}", pr.repo, pr.number, pr.title, pr.author)
             .to_lowercase()
             .contains(&f)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Side {
+    All,
+    Org {
+        org: String,
+        collapsed: bool,
+    },
+    Repo {
+        repo: String,
+        name: String,
+        pinned: bool,
+        hidden: bool,
+    },
+}
+
+/// A sidebar row; `key` is `all`, `org:<org>` or `repo:<owner/name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SideItem {
+    pub key: String,
+    pub side: Side,
+    pub total: usize,
+    pub unread: usize,
+}
+
+pub struct SidebarOpts<'a> {
+    pub repos: &'a [String],
+    pub inbox: &'a [&'a PrSummary],
+    pub pinned: &'a [String],
+    pub hidden: &'a [String],
+    pub collapsed: &'a HashSet<String>,
+    pub show_hidden: bool,
+    /// Hide repos with no PRs in the inbox (pinned repos stay).
+    pub only_with_prs: bool,
+    pub filter: &'a str,
+}
+
+fn org_of(repo: &str) -> &str {
+    repo.split('/').next().unwrap_or(repo)
+}
+
+/// Flat sidebar: All, then orgs (with PRs first) and their repos (pinned, then with PRs, then the rest).
+pub fn sidebar_items(o: &SidebarOpts) -> Vec<SideItem> {
+    let filter = o.filter.to_lowercase();
+    let (mut by_repo, mut by_org) = (HashMap::new(), HashMap::new());
+    for pr in o.inbox {
+        for (map, key) in [(&mut by_repo, &*pr.repo), (&mut by_org, org_of(&pr.repo))] {
+            let c: &mut (usize, usize) = map.entry(key).or_default();
+            c.0 += 1;
+            c.1 += pr.unread as usize;
+        }
+    }
+    let mut orgs: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut seen = HashSet::new();
+    let all = o.repos.iter().map(String::as_str);
+    for repo in all.chain(o.inbox.iter().map(|p| &*p.repo)) {
+        if !seen.insert(repo)
+            || (o.hidden.iter().any(|h| h == repo) && !o.show_hidden)
+            || (o.only_with_prs
+                && !by_repo.contains_key(repo)
+                && !o.pinned.iter().any(|p| p == repo))
+            || !repo.to_lowercase().contains(&filter)
+        {
+            continue;
+        }
+        orgs.entry(org_of(repo)).or_default().push(repo);
+    }
+    // With PRs first, then by name, ignoring case.
+    let rank = |counts: &HashMap<&str, (usize, usize)>, a: &str| {
+        (!counts.contains_key(a), a.to_lowercase())
+    };
+    let mut names: Vec<&str> = orgs.keys().copied().collect();
+    names.sort_by_key(|o| rank(&by_org, o));
+
+    let unread = o.inbox.iter().filter(|p| p.unread).count();
+    let mut items = vec![SideItem {
+        key: "all".into(),
+        side: Side::All,
+        total: o.inbox.len(),
+        unread,
+    }];
+    for org in names {
+        let collapsed = o.collapsed.contains(org) && filter.is_empty();
+        let (total, unread) = by_org.get(org).copied().unwrap_or_default();
+        items.push(SideItem {
+            key: format!("org:{org}"),
+            side: Side::Org {
+                org: org.into(),
+                collapsed,
+            },
+            total,
+            unread,
+        });
+        if collapsed {
+            continue;
+        }
+        let pinned = |r: &str| o.pinned.iter().any(|p| p == r);
+        let mut repos = orgs.remove(org).unwrap();
+        repos.sort_by_key(|r| (!pinned(r), rank(&by_repo, r)));
+        for repo in repos {
+            let (total, unread) = by_repo.get(repo).copied().unwrap_or_default();
+            items.push(SideItem {
+                key: format!("repo:{repo}"),
+                side: Side::Repo {
+                    repo: repo.into(),
+                    name: repo[org.len() + 1..].into(),
+                    pinned: pinned(repo),
+                    hidden: o.hidden.iter().any(|h| h == repo),
+                },
+                total,
+                unread,
+            });
+        }
+    }
+    items
+}
+
+/// Whether a PR belongs to the sidebar selection (`all`, `org:<org>`, `repo:<owner/name>`).
+pub fn in_scope(pr: &PrSummary, key: &str) -> bool {
+    if let Some(org) = key.strip_prefix("org:") {
+        return org_of(&pr.repo) == org;
+    }
+    if let Some(repo) = key.strip_prefix("repo:") {
+        return pr.repo == repo;
+    }
+    true
 }
 
 /// Tree lines of a stacked row at `depth`. `last`: no sibling below it, so its `└` doesn't carry
@@ -412,6 +539,86 @@ mod tests {
             next,
             snoozed_until: None,
         }
+    }
+
+    #[test]
+    fn sidebar_orders_orgs_and_repos_counts_hides_filters() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let repos = s(&["zeta/a", "acme/web", "acme/api", "acme/old", "acme/tools"]);
+        let mut unread = pr("acme/web", None);
+        unread.unread = true;
+        let prs = [unread, pr("acme/web", None), pr("ext/lib", None)];
+        let inbox: Vec<&PrSummary> = prs.iter().collect();
+        let (pinned, hidden) = (s(&["acme/tools"]), s(&["acme/old"]));
+        let none = HashSet::new();
+        let acme = HashSet::from(["acme".to_string()]);
+        let base = SidebarOpts {
+            repos: &repos,
+            inbox: &inbox,
+            pinned: &pinned,
+            hidden: &hidden,
+            collapsed: &none,
+            show_hidden: false,
+            only_with_prs: false,
+            filter: "",
+        };
+        let keys = |o: &SidebarOpts| -> Vec<String> {
+            sidebar_items(o).into_iter().map(|i| i.key).collect()
+        };
+        assert_eq!(
+            keys(&base),
+            [
+                "all",
+                "org:acme",
+                "repo:acme/tools",
+                "repo:acme/web",
+                "repo:acme/api",
+                "org:ext",
+                "repo:ext/lib",
+                "org:zeta",
+                "repo:zeta/a",
+            ]
+        );
+        let items = sidebar_items(&base);
+        assert_eq!((items[0].total, items[0].unread), (3, 1));
+        assert_eq!((items[1].total, items[1].unread), (2, 1));
+        let show = SidebarOpts {
+            show_hidden: true,
+            ..base
+        };
+        assert!(keys(&show).contains(&"repo:acme/old".into()));
+        let only = SidebarOpts {
+            only_with_prs: true,
+            ..base
+        };
+        assert_eq!(
+            keys(&only),
+            [
+                "all",
+                "org:acme",
+                "repo:acme/tools",
+                "repo:acme/web",
+                "org:ext",
+                "repo:ext/lib",
+            ]
+        );
+        let folded = SidebarOpts {
+            collapsed: &acme,
+            ..base
+        };
+        assert_eq!(keys(&folded)[..3], ["all", "org:acme", "org:ext"]);
+        let found = SidebarOpts {
+            collapsed: &acme,
+            filter: "WEB",
+            ..base
+        };
+        assert_eq!(keys(&found), ["all", "org:acme", "repo:acme/web"]);
+
+        let web = pr("acme/web", None);
+        assert!(in_scope(&web, "org:acme"));
+        assert!(!in_scope(&web, "org:acm"));
+        assert!(in_scope(&web, "repo:acme/web"));
+        assert!(in_scope(&web, "all"));
     }
 
     #[test]

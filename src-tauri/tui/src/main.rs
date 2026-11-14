@@ -10,8 +10,9 @@ use ghreviewer_core::{
     config::Prompt,
     err,
     inbox::{
-        BotReview, PrRow, bot_reviews, by_next, can_approve, can_wait, matches_filter, parse_ms,
-        picked_by_default, rel_time, stack_leads, stack_rows,
+        BotReview, PrRow, Side, SideItem, SidebarOpts, bot_reviews, by_next, can_approve, can_wait,
+        in_scope, matches_filter, parse_ms, picked_by_default, rel_time, sidebar_items,
+        stack_leads, stack_rows,
     },
     jira::Ticket,
     local::Worktree,
@@ -28,7 +29,7 @@ use ratatui::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     sync::{Arc, mpsc},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -66,7 +67,7 @@ const HELP: &[(&str, &str)] = &[
         "j / k, gg / G",
         "next / previous (findings in a prompt tab), top / bottom",
     ),
-    ("Tab, h / l", "inbox / PR pane"),
+    ("Tab, h / l", "repos / inbox / PR pane"),
     (
         "Enter",
         "open a run listed above the inbox, or go to the PR pane",
@@ -77,7 +78,7 @@ const HELP: &[(&str, &str)] = &[
         "previous / next tab: the PR, Jira, review bots, then each prompt",
     ),
     ("{ / }", "previous / next ticket (Jira tab)"),
-    ("/", "filter the inbox; Esc clears it"),
+    ("/", "filter the inbox or the repos; Esc clears it"),
     ("t", "next rule (all, then each rule)"),
     ("o", "open the PR in the browser (over SSH: copy its link)"),
     ("u", "toggle unread"),
@@ -99,7 +100,10 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("X", "cancel the tab's run"),
     ("c", "continue the tab's agent session in a terminal"),
-    ("Space", "pick a finding"),
+    ("Space", "pick a finding; fold an org (repos)"),
+    ("p / x", "pin / hide the repo (repos)"),
+    ("H", "show hidden repos"),
+    ("e", "only repos with PRs (repos)"),
     ("p", "post the picked findings as a review"),
     ("f", "send the picked findings to the [fix] agent"),
     ("Ctrl-r", "sync now"),
@@ -160,6 +164,19 @@ struct App {
     active: Vec<Run>,
     /// The run under the cursor, when it's in that list rather than on a PR.
     run_sel: Option<usize>,
+    /// The repos column has the keys (`pr_focus` is then false).
+    side_focus: bool,
+    /// Repos the sync knows, for the repos column.
+    repos: Vec<String>,
+    side: Vec<SideItem>,
+    /// What the inbox shows: `all`, `org:<org>` or `repo:<owner/name>`.
+    side_key: String,
+    /// Folded orgs.
+    collapsed: HashSet<String>,
+    show_hidden: bool,
+    only_with_prs: bool,
+    repo_filter: String,
+    help_scroll: u16,
 }
 
 /// Name of the Jira tab among the PR pane's tabs ("" for the PR, `<bot>`, prompt names).
@@ -266,6 +283,10 @@ impl App {
         if self.smart {
             by_next(&mut self.inbox);
         }
+        match backend::list_repos(&self.st) {
+            Ok(repos) => self.repos = repos.into_iter().map(|r| r.name_with_owner).collect(),
+            Err(e) => self.flash = Some((err(e), FAIL)),
+        }
         self.load_active();
         self.rebuild();
     }
@@ -323,6 +344,10 @@ impl App {
         if !self.rule.is_empty() && !target.rules.contains(&self.rule) {
             self.rule.clear();
         }
+        if !in_scope(target, &self.side_key) {
+            self.side_key = "all".into();
+        }
+        self.side_focus = false;
         self.picked = Some(run.pr_id.clone());
         self.rebuild();
         self.go(self.sel); // picks it, like moving onto it
@@ -332,9 +357,28 @@ impl App {
     }
 
     fn rebuild(&mut self) {
-        let (rule, filter) = (&self.rule, &self.filter);
+        let rule = &self.rule;
+        let in_rule = |p: &PrSummary| !p.context && (rule.is_empty() || p.rules.contains(rule));
+        let mine: Vec<&PrSummary> = self.inbox.iter().filter(|p| in_rule(p)).collect();
+        let cfg = self.st.cfg.read().unwrap();
+        self.side = sidebar_items(&SidebarOpts {
+            repos: &self.repos,
+            inbox: &mine,
+            pinned: &cfg.repos.pinned,
+            hidden: &cfg.repos.hidden,
+            collapsed: &self.collapsed,
+            show_hidden: self.show_hidden,
+            only_with_prs: self.only_with_prs,
+            filter: &self.repo_filter,
+        });
+        drop(cfg);
+        // A hidden, folded or filtered-out scope falls back to all.
+        if !self.side.iter().any(|i| i.key == self.side_key) {
+            self.side_key = "all".into();
+        }
+        let (filter, scope) = (&self.filter, &self.side_key);
         self.rows = stack_rows(&self.inbox, |p| {
-            !p.context && (rule.is_empty() || p.rules.contains(rule)) && matches_filter(p, filter)
+            in_rule(p) && in_scope(p, scope) && matches_filter(p, filter)
         });
         self.leads = if self.smart {
             stack_leads(&self.inbox, &self.rows)
@@ -655,16 +699,21 @@ impl App {
         self.flash = None;
         match self.mode {
             Mode::Filter => {
+                let filter = if self.side_focus {
+                    &mut self.repo_filter
+                } else {
+                    &mut self.filter
+                };
                 match k.code {
                     KeyCode::Esc => {
-                        self.filter.clear();
+                        filter.clear();
                         self.mode = Mode::Normal;
                     }
                     KeyCode::Enter => self.mode = Mode::Normal,
                     KeyCode::Backspace => {
-                        self.filter.pop();
+                        filter.pop();
                     }
-                    KeyCode::Char(c) => self.filter.push(c),
+                    KeyCode::Char(c) => filter.push(c),
                     _ => return true,
                 }
                 self.rebuild();
@@ -726,12 +775,23 @@ impl App {
                 return true;
             }
             Mode::Help => {
-                self.mode = Mode::Normal;
+                match k.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.help_scroll = (self.help_scroll + 1).min(HELP.len() as u16)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1)
+                    }
+                    _ => self.mode = Mode::Normal,
+                }
                 return true;
             }
             Mode::Normal => {}
         }
         let was_g = std::mem::take(&mut self.pending_g);
+        if self.side_focus && self.side_keys(k.code, was_g) {
+            return true;
+        }
         let half = (self.pane_height / 2).max(1) as i32;
         let last = self.rows.len().saturating_sub(1);
         match (k.code, ctrl) {
@@ -770,13 +830,20 @@ impl App {
                 self.run_sel = None;
                 self.go(last)
             }
-            (KeyCode::Tab | KeyCode::BackTab, _) => self.pr_focus = !self.pr_focus,
+            (KeyCode::Tab | KeyCode::BackTab, _) => {
+                (self.pr_focus, self.side_focus) = (!self.pr_focus, false)
+            }
             (KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter, _) => match self.run_sel {
                 Some(i) if !self.pr_focus => self.open_run(i),
                 _ => self.pr_focus = true,
             },
             (KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc, _) if self.pr_focus => {
                 self.pr_focus = false
+            }
+            (KeyCode::Char('h') | KeyCode::Left, _) => self.side_focus = true,
+            (KeyCode::Char('H'), _) => {
+                self.show_hidden = !self.show_hidden;
+                self.rebuild();
             }
             (KeyCode::Esc, _) if !self.filter.is_empty() => {
                 self.filter.clear();
@@ -802,7 +869,7 @@ impl App {
                 Some(_) => self.mode = Mode::Snooze,
                 None => {}
             },
-            (KeyCode::Char('?'), _) => self.mode = Mode::Help,
+            (KeyCode::Char('?'), _) => (self.mode, self.help_scroll) = (Mode::Help, 0),
             (KeyCode::Char(c @ ('{' | '}')), _) if self.tab() == JIRA_TAB => {
                 let keys: Vec<&str> = self.tickets.iter().map(|t| t.key.as_str()).collect();
                 let at = self
@@ -888,6 +955,66 @@ impl App {
         true
     }
 
+    /// A key in the repos column; false when it's not one of its own.
+    fn side_keys(&mut self, code: KeyCode, was_g: bool) -> bool {
+        let at = self.side.iter().position(|i| i.key == self.side_key);
+        let at = at.unwrap_or(0);
+        let item = self.side.get(at).cloned();
+        let go = |app: &mut Self, i: usize| {
+            if let Some(it) = app.side.get(i.min(app.side.len().saturating_sub(1))) {
+                app.side_key = it.key.clone();
+                app.rebuild();
+            }
+        };
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => go(self, at + 1),
+            KeyCode::Char('k') | KeyCode::Up => go(self, at.saturating_sub(1)),
+            KeyCode::Char('g') if was_g => go(self, 0),
+            KeyCode::Char('g') => self.pending_g = true,
+            KeyCode::Char('G') => go(self, usize::MAX),
+            KeyCode::Char('l' | 'h') | KeyCode::Right | KeyCode::Enter | KeyCode::Tab => {
+                self.side_focus = false
+            }
+            KeyCode::Esc if !self.repo_filter.is_empty() => {
+                self.repo_filter.clear();
+                self.rebuild();
+            }
+            KeyCode::Esc => self.side_focus = false,
+            KeyCode::Char('e') => {
+                self.only_with_prs = !self.only_with_prs;
+                self.rebuild();
+            }
+            KeyCode::Char(' ') => {
+                if let Some(Side::Org { org, .. }) = item.map(|i| i.side) {
+                    if !self.collapsed.remove(&org) {
+                        self.collapsed.insert(org);
+                    }
+                    self.rebuild();
+                }
+            }
+            KeyCode::Char(c @ ('p' | 'x')) => {
+                if let Some(Side::Repo {
+                    repo,
+                    pinned,
+                    hidden,
+                    ..
+                }) = item.map(|i| i.side)
+                {
+                    let (flag, on) = if c == 'p' {
+                        ("pinned", !pinned)
+                    } else {
+                        ("hidden", !hidden)
+                    };
+                    // The config watcher reloads, which re-sorts the column.
+                    let res = backend::set_repo_flag(&self.st, &repo, flag, on);
+                    self.say(res);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn findings_len(&self) -> usize {
         self.tab_review().map_or(0, |(_, f)| f.len())
     }
@@ -940,16 +1067,85 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let [main, bar] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
-        // 40%, but room for a repo#number and its age on narrow screens.
-        let inbox_w = (main.width * 2 / 5).max(main.width.min(96) / 2);
-        let [left, right] =
-            Layout::horizontal([Constraint::Length(inbox_w), Constraint::Fill(1)]).areas(main);
-        self.draw_inbox(f, left);
-        self.draw_pr(f, right);
+        // The repos column stays on wide screens; on narrow ones it shows while it has the keys,
+        // in place of the PR pane.
+        let wide = main.width >= 140;
+        let side_w = if wide || self.side_focus { 28 } else { 0 };
+        let [side, main] =
+            Layout::horizontal([Constraint::Length(side_w), Constraint::Fill(1)]).areas(main);
+        if side_w > 0 {
+            self.draw_side(f, side);
+        }
+        if self.side_focus && !wide {
+            self.draw_inbox(f, main);
+        } else {
+            // 40%, but room for a repo#number and its age on narrow screens.
+            let inbox_w = (main.width * 2 / 5).max(main.width.min(96) / 2);
+            let [left, right] =
+                Layout::horizontal([Constraint::Length(inbox_w), Constraint::Fill(1)]).areas(main);
+            self.draw_inbox(f, left);
+            self.draw_pr(f, right);
+        }
         self.draw_bar(f, bar);
         if self.mode == Mode::Help {
             self.draw_help(f);
         }
+    }
+
+    fn draw_side(&self, f: &mut Frame, area: Rect) {
+        let mut title = " Repos ".to_string();
+        if self.only_with_prs {
+            title += "with PRs ";
+        }
+        if self.show_hidden {
+            title += "+hidden ";
+        }
+        let block = Block::bordered()
+            .title(title)
+            .border_style(if self.side_focus { ACCENT } else { DIM });
+        let width = block.inner(area).width as usize;
+        let items: Vec<ListItem> = self
+            .side
+            .iter()
+            .map(|it| {
+                let (label, style) = match &it.side {
+                    Side::All => ("All".to_string(), Style::new().bold()),
+                    Side::Org { org, collapsed } => (
+                        format!("{} {org}", if *collapsed { "▸" } else { "▾" }),
+                        Style::new().bold(),
+                    ),
+                    Side::Repo {
+                        name,
+                        pinned,
+                        hidden,
+                        ..
+                    } => (
+                        format!(
+                            "  {name}{}{}",
+                            if *pinned { " ★" } else { "" },
+                            if *hidden { " (hidden)" } else { "" }
+                        ),
+                        if it.total > 0 {
+                            Style::new()
+                        } else {
+                            Style::new().fg(DIM)
+                        },
+                    ),
+                };
+                let count = match (it.total, it.unread) {
+                    (0, _) => vec![],
+                    (t, 0) => vec![Span::styled(t.to_string(), DIM)],
+                    (t, u) => vec![Span::styled(format!("{u}/{t}"), ACCENT)],
+                };
+                ListItem::new(spread(vec![Span::styled(label, style)], count, width))
+            })
+            .collect();
+        let at = self.side.iter().position(|i| i.key == self.side_key);
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::new().bg(Color::Indexed(236)));
+        let mut state = ListState::default().with_selected(at);
+        f.render_stateful_widget(list, area, &mut state);
     }
 
     fn draw_inbox(&self, f: &mut Frame, area: Rect) {
@@ -967,10 +1163,16 @@ impl App {
             )
         };
         let shown = self.rows.iter().filter(|r| !r.dim).count();
-        let title = format!(" Inbox {shown}{rule} ");
+        // The org, or the repo without it: the inbox is narrow.
+        let scope = match self.side_key.split_once(':') {
+            Some((_, name)) => format!(" · {}", name.rsplit('/').next().unwrap_or(name)),
+            None => String::new(),
+        };
+        let title = format!(" Inbox{scope} {shown}{rule} ");
+        let focused = !self.pr_focus && !self.side_focus;
         let block = Block::bordered()
             .title(title)
-            .border_style(if self.pr_focus { DIM } else { ACCENT });
+            .border_style(if focused { ACCENT } else { DIM });
         let width = block.inner(area).width as usize;
         let mut items: Vec<ListItem> = self
             .active
@@ -1301,11 +1503,19 @@ impl App {
             height,
         );
         f.render_widget(Clear, at);
-        let block = Block::bordered().title(" Keys ").border_style(ACCENT);
+        let cut = lines.len() as u16 + 2 > area.height;
+        let title = if cut {
+            " Keys · j/k scroll "
+        } else {
+            " Keys "
+        };
+        let block = Block::bordered().title(title).border_style(ACCENT);
+        let scroll = self.help_scroll.min(lines.len() as u16);
         f.render_widget(
             Paragraph::new(lines)
                 .block(block)
-                .wrap(Wrap { trim: false }),
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
             at,
         );
     }
@@ -1314,8 +1524,12 @@ impl App {
         let dim = |s: String| Span::styled(s, DIM);
         let left: Vec<Span> = match self.mode {
             Mode::Filter => vec![
-                Span::styled("/", ACCENT),
-                Span::raw(self.filter.clone()),
+                Span::styled(if self.side_focus { "repos /" } else { "/" }, ACCENT),
+                Span::raw(if self.side_focus {
+                    self.repo_filter.clone()
+                } else {
+                    self.filter.clone()
+                }),
                 Span::raw("█"),
             ],
             Mode::Snooze => vec![
@@ -1389,7 +1603,7 @@ impl App {
                 spans
             }
         };
-        let keys = "j/k move · Tab pane · [ ] tabs · / filter · ? keys · q quit";
+        let keys = "j/k move · h/l panes · [ ] tabs · / filter · ? keys · q quit";
         let keys_w = keys.chars().count() as u16;
         // The hints only when they leave room for the status.
         let keys_w = if area.width >= keys_w + 40 { keys_w } else { 0 };
@@ -1434,6 +1648,15 @@ fn main() -> anyhow::Result<()> {
         sel: 0,
         picked: None,
         pr_focus: false,
+        side_focus: false,
+        repos: Vec::new(),
+        side: Vec::new(),
+        side_key: "all".into(),
+        collapsed: HashSet::new(),
+        show_hidden: false,
+        only_with_prs: false,
+        repo_filter: String::new(),
+        help_scroll: 0,
         detail_key: None,
         detail: None,
         lines: None,
