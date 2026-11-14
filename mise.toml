@@ -10,6 +10,10 @@ run = "bun install"
 description = "Run the app in dev mode"
 run = "bun tauri dev"
 
+[tasks.tui]
+description = "Run the terminal UI"
+run = "cargo run --manifest-path src-tauri/Cargo.toml -p ghreviewer-tui"
+
 [tasks.build]
 description = "Build the macOS app bundle"
 run = "bun tauri build"

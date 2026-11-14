@@ -281,7 +281,7 @@ mise run fmt    # cargo fmt + oxfmt
 `src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox with active runs above it, the PR, its Jira tickets, review bots' open threads, prompt runs and their findings (pick, post, fix), approving and worktrees; not yet the repo sidebar, or images. `?` lists the keys.
 
 ```sh
-cd src-tauri && cargo run -p ghreviewer-tui
+mise run tui
 ```
 
 Review-comment hunks go through [delta](https://github.com/dandavison/delta) when it's installed. Over SSH, `o` copies the PR link to your clipboard (OSC 52; tmux needs `set -g set-clipboard on`).
