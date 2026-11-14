@@ -15,13 +15,15 @@ use std::{
     process::{Command, Stdio},
 };
 
-// shortcut: colors fit dark terminals; read the config's theme if light ones need it.
+// The defaults, for dark terminals; `main` swaps them for the config theme's colors.
 pub const DIM: Color = Color::Indexed(244);
 pub const ACCENT: Color = Color::Cyan;
 const CODE: Color = Color::Indexed(180);
 pub const OK: Color = Color::Green;
 pub const WARN: Color = Color::Yellow;
 pub const FAIL: Color = Color::Red;
+/// Background of the selected row.
+pub const SEL: Color = Color::Indexed(236);
 
 fn s<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or("")

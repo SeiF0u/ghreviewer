@@ -278,7 +278,7 @@ mise run fmt    # cargo fmt + oxfmt
 
 ### Terminal UI (experimental)
 
-`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox with active runs above it, the PR, its Jira tickets, review bots' open threads, prompt runs and their findings (pick, post, fix), approving, worktrees and the repos column (`h` from the inbox; it stays on screens 140 columns wide); not yet images. `?` lists the keys.
+`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox with active runs above it, the PR, its Jira tickets, review bots' open threads, prompt runs and their findings (pick, post, fix), approving, worktrees and the repos column (`h` from the inbox; it stays on screens 140 columns wide). It uses the config theme's colors when the terminal has 24-bit color (`COLORTERM=truecolor`), `,` edits the config in `$EDITOR`, and `O` opens a file a run wrote. Not yet images. `?` lists the keys.
 
 ```sh
 mise run tui

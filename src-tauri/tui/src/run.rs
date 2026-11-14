@@ -1,6 +1,6 @@
 //! A prompt tab: the latest run of a prompt on the PR, like `src/RunView.tsx`.
 
-use crate::pr::{ACCENT, DIM, FAIL, OK, WARN, html};
+use crate::pr::{ACCENT, DIM, FAIL, OK, SEL, WARN, html};
 use ghreviewer_core::{
     agent::{Finding, Run, RunStatus},
     config::Prompt,
@@ -66,6 +66,11 @@ fn pieces(items: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// A run's file by its name: they all sit in the run's folder.
+pub fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn duration(ms: u64) -> String {
     let s = (ms + 500) / 1000;
     if s < 60 {
@@ -117,7 +122,7 @@ fn finding_lines(
         ])
         .style(style);
         if i == cursor {
-            first = first.patch_style(Style::new().bg(Color::Indexed(236)));
+            first = first.patch_style(Style::new().bg(SEL));
         }
         lines.push(first);
         let indent = " ".repeat(2 + head.chars().count());
@@ -307,9 +312,14 @@ pub fn view(a: Args) -> View {
     }
     if !run.files.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(dim("Files".into()));
-        for f in &run.files {
-            text(&mut lines, f, Style::new().fg(DIM));
+        lines.push(dim("Files · O open".into()));
+        for (i, f) in run.files.iter().enumerate() {
+            let n = if run.files.len() > 1 {
+                format!("{} ", i + 1)
+            } else {
+                String::new()
+            };
+            text(&mut lines, &format!("{n}{}", file_name(f)), Style::new());
         }
     }
     if !run.activity.is_empty() {

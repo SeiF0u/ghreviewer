@@ -18,7 +18,7 @@ use ghreviewer_core::{
     local::Worktree,
     sync::PrSummary,
 };
-use pr::{ACCENT, DIM, FAIL, OK, WARN, check_glyph, review_label};
+use pr::{ACCENT, DIM, FAIL, OK, SEL, WARN, check_glyph, review_label};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event as Input, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -31,7 +31,11 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::SeqCst},
+        mpsc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -59,6 +63,8 @@ enum Mode {
     },
     /// Picking an `open_with` entry for the worktree.
     Opener,
+    /// Picking a file of the tab's run to open.
+    File,
     Help,
 }
 
@@ -106,6 +112,8 @@ const HELP: &[(&str, &str)] = &[
     ("e", "only repos with PRs (repos)"),
     ("p", "post the picked findings as a review"),
     ("f", "send the picked findings to the [fix] agent"),
+    ("O", "open a file the tab's run wrote"),
+    (",", "edit the config in $EDITOR (applies on save)"),
     ("Ctrl-r", "sync now"),
     ("q, Ctrl-c", "quit"),
 ];
@@ -177,6 +185,10 @@ struct App {
     only_with_prs: bool,
     repo_filter: String,
     help_scroll: u16,
+    /// The default colors and the config theme's in their place.
+    theme: Vec<(Color, Color)>,
+    /// Hand the terminal to `$EDITOR` on the config, after this key.
+    edit_config: bool,
 }
 
 /// Name of the Jira tab among the PR pane's tabs ("" for the PR, `<bot>`, prompt names).
@@ -238,6 +250,64 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     Line::from(spans)
 }
 
+/// What to swap the default colors for: the theme's, when the terminal shows 24-bit color. The
+/// terminal keeps its own background and text colors.
+fn theme(
+    theme: Option<&std::collections::BTreeMap<String, String>>,
+    truecolor: bool,
+) -> Vec<(Color, Color)> {
+    let (Some(theme), true) = (theme, truecolor) else {
+        return Vec::new();
+    };
+    let hex = |key: &str| {
+        let h = theme.get(key)?.strip_prefix('#')?;
+        let n = u32::from_str_radix(h, 16).ok().filter(|_| h.len() == 6)?;
+        Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    };
+    let keys = [("dim", DIM), ("accent", ACCENT), ("ok", OK), ("fail", FAIL)];
+    let keys = keys.into_iter().chain([("warn", WARN), ("sel", SEL)]);
+    keys.filter_map(|(k, from)| Some((from, hex(k)?))).collect()
+}
+
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
+
+/// Opening something would happen on the server, not in front of you.
+fn over_ssh() -> bool {
+    std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some()
+}
+
+/// The input thread stops reading while `$EDITOR` has the terminal; `IDLE` says it has stopped.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static IDLE: AtomicBool = AtomicBool::new(false);
+
+/// Runs `$VISUAL` / `$EDITOR` (vi without them) on `path` in the terminal, the TUI set aside.
+fn edit(path: &std::path::Path) -> anyhow::Result<()> {
+    IDLE.store(false, SeqCst);
+    PAUSED.store(true, SeqCst);
+    while !IDLE.load(SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ratatui::restore();
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    // Through sh, for editors with arguments (`code -w`).
+    let res = std::process::Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "sh"])
+        .arg(path)
+        .status();
+    PAUSED.store(false, SeqCst);
+    match res {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => anyhow::bail!("{editor} exited with {s}"),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn base64(bytes: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -275,6 +345,8 @@ impl App {
         if !self.rules.contains(&self.rule) {
             self.rule.clear(); // a renamed or removed rule falls back to all
         }
+        let truecolor = std::env::var("COLORTERM").is_ok_and(|c| c == "truecolor" || c == "24bit");
+        self.theme = theme(cfg.themes.get(&cfg.theme), truecolor);
         self.status = self.st.status.lock().unwrap().clone();
         match backend::list_inbox(&self.st) {
             Ok(inbox) => self.inbox = inbox,
@@ -674,19 +746,26 @@ impl App {
             return;
         };
         // Over SSH, `open` would run on the server: copy the link to your clipboard instead (OSC 52).
-        if std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some() {
+        if over_ssh() {
             let mut out = std::io::stdout();
             let _ = write!(out, "\x1b]52;c;{}\x07", base64(url.as_bytes()));
             let _ = out.flush();
             self.flash = Some(("link copied".into(), OK));
             return;
         }
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
+        let res = std::process::Command::new(OPENER).arg(&url).spawn();
+        self.say(res.map(drop).map_err(Into::into));
+    }
+
+    fn open_file(&mut self, i: usize) {
+        let Some(path) = self.tab_run().and_then(|r| r.files.get(i)).cloned() else {
+            return;
         };
-        let res = std::process::Command::new(opener).arg(&url).spawn();
+        if over_ssh() {
+            self.flash = Some((format!("on the server: {path}"), ACCENT));
+            return;
+        }
+        let res = std::process::Command::new(OPENER).arg(&path).spawn();
         self.say(res.map(drop).map_err(Into::into));
     }
 
@@ -767,11 +846,15 @@ impl App {
                 }
                 return true;
             }
-            Mode::Opener => {
-                self.mode = Mode::Normal;
+            Mode::Opener | Mode::File => {
                 if let KeyCode::Char(c @ '1'..='9') = k.code {
-                    self.worktree(c as usize - '1' as usize);
+                    let i = c as usize - '1' as usize;
+                    match self.mode {
+                        Mode::File => self.open_file(i),
+                        _ => self.worktree(i),
+                    }
                 }
+                self.mode = Mode::Normal;
                 return true;
             }
             Mode::Help => {
@@ -882,6 +965,12 @@ impl App {
             (KeyCode::Char('['), _) => self.switch_tab(-1),
             (KeyCode::Char(']'), _) => self.switch_tab(1),
             (KeyCode::Char('w'), _) => self.worktree(0),
+            (KeyCode::Char('O'), _) => match self.tab_run().map_or(0, |r| r.files.len()) {
+                0 => {}
+                1 => self.open_file(0),
+                _ => self.mode = Mode::File,
+            },
+            (KeyCode::Char(','), _) => self.edit_config = true,
             (KeyCode::Char('W'), _) => {
                 let openers = self.st.cfg.read().unwrap().open_with.len();
                 if self.wt.as_ref().is_some_and(|w| w.path.is_some()) && openers > 0 {
@@ -1090,6 +1179,16 @@ impl App {
         if self.mode == Mode::Help {
             self.draw_help(f);
         }
+        for cell in &mut f.buffer_mut().content {
+            for (from, to) in &self.theme {
+                if cell.fg == *from {
+                    cell.fg = *to;
+                }
+                if cell.bg == *from {
+                    cell.bg = *to;
+                }
+            }
+        }
     }
 
     fn draw_side(&self, f: &mut Frame, area: Rect) {
@@ -1143,7 +1242,7 @@ impl App {
         let at = self.side.iter().position(|i| i.key == self.side_key);
         let list = List::new(items)
             .block(block)
-            .highlight_style(Style::new().bg(Color::Indexed(236)));
+            .highlight_style(Style::new().bg(SEL));
         let mut state = ListState::default().with_selected(at);
         f.render_stateful_widget(list, area, &mut state);
     }
@@ -1211,7 +1310,7 @@ impl App {
         }
         let list = List::new(items)
             .block(block)
-            .highlight_style(Style::new().bg(Color::Indexed(236)));
+            .highlight_style(Style::new().bg(SEL));
         let mut state = ListState::default().with_selected(at);
         f.render_stateful_widget(list, area, &mut state);
     }
@@ -1570,6 +1669,19 @@ impl App {
                     dim(names.join(" · ") + " · any other key cancels"),
                 ]
             }
+            Mode::File => {
+                let files = self.tab_run().map(|r| r.files.clone()).unwrap_or_default();
+                let names: Vec<String> = files
+                    .iter()
+                    .take(9)
+                    .enumerate()
+                    .map(|(i, f)| format!("{} {}", i + 1, run::file_name(f)))
+                    .collect();
+                vec![
+                    Span::styled("open: ", ACCENT),
+                    dim(names.join(" · ") + " · any other key cancels"),
+                ]
+            }
             Mode::Help => vec![dim("any key closes".into())],
             Mode::Normal => {
                 let mut spans = vec![];
@@ -1625,7 +1737,19 @@ fn main() -> anyhow::Result<()> {
     let _watcher = backend::start(&st)?;
     let input = tx.clone();
     std::thread::spawn(move || {
-        while let Ok(e) = event::read() {
+        loop {
+            if PAUSED.load(SeqCst) {
+                IDLE.store(true, SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            // Polls, so a pause doesn't wait for a key: the editor must get them all.
+            let e = match event::poll(Duration::from_millis(50)) {
+                Ok(true) => event::read(),
+                Ok(false) => continue,
+                Err(e) => Err(e),
+            };
+            let Ok(e) = e else { break };
             if input.send(Msg::Input(e)).is_err() {
                 break;
             }
@@ -1657,6 +1781,8 @@ fn main() -> anyhow::Result<()> {
         only_with_prs: false,
         repo_filter: String::new(),
         help_scroll: 0,
+        theme: Vec::new(),
+        edit_config: false,
         detail_key: None,
         detail: None,
         lines: None,
@@ -1698,6 +1824,11 @@ fn main() -> anyhow::Result<()> {
             if !app.update(msg) {
                 return Ok(());
             }
+            if std::mem::take(&mut app.edit_config) {
+                let res = edit(&app.st.cfg_path);
+                term = ratatui::init();
+                app.say(res); // a bad config shows in the status bar once the watcher reads it
+            }
             // Catch up before drawing again: a sync sends a burst.
             while let Ok(msg) = rx.try_recv() {
                 if !app.update(msg) {
@@ -1712,6 +1843,17 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_swaps_the_colors_it_has() {
+        let t = [("accent", "#ff2fa8"), ("ok", "nope"), ("font", "Menlo")];
+        let t = t.map(|(k, v)| (k.to_string(), v.to_string())).into();
+        assert_eq!(theme(Some(&t), true), [(ACCENT, Color::Rgb(255, 47, 168))]);
+        assert!(theme(Some(&t), false).is_empty());
+        assert!(theme(None, true).is_empty());
+    }
+
     #[test]
     fn base64_pads() {
         assert_eq!(super::base64(b"hi"), "aGk=");
