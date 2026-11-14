@@ -1,6 +1,6 @@
 //! A prompt tab: the latest run of a prompt on the PR, like `src/RunView.tsx`.
 
-use crate::pr::{ACCENT, DIM, FAIL, OK, WARN};
+use crate::pr::{ACCENT, DIM, FAIL, OK, WARN, html};
 use ghreviewer_core::{
     agent::{Finding, Run, RunStatus},
     config::Prompt,
@@ -38,6 +38,15 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// Markdown (GitHub's flavour) in lines of `width`, like the desktop's `marked`.
+pub fn markdown(text: &str, width: usize) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Options, Parser};
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut out = String::new();
+    pulldown_cmark::html::push_html(&mut out, Parser::new_ext(text, opts));
+    html(&out, width)
 }
 
 /// `items` joined by ` · `, onto as many lines of `width` as they need.
@@ -124,8 +133,9 @@ fn finding_lines(
                 lines.push(Line::styled(format!("    {l}"), DIM));
             }
         }
-        for l in wrap(&f.body, width.saturating_sub(4)) {
-            lines.push(Line::styled(format!("    {l}"), style));
+        for mut l in markdown(&f.body, width.saturating_sub(4)) {
+            l.spans.insert(0, Span::raw("    "));
+            lines.push(l.patch_style(style));
         }
     }
     starts
@@ -286,14 +296,14 @@ pub fn view(a: Args) -> View {
         lines.extend(pieces(actions, a.width));
         if !review.summary.is_empty() {
             lines.push(Line::raw(""));
-            text(&mut lines, &review.summary, Style::new());
+            lines.extend(markdown(&review.summary, a.width));
         }
         findings = finding_lines(&mut lines, &review.findings, a.picked, a.cursor, a.width);
     }
 
     if !run.output.is_empty() {
         lines.push(Line::raw(""));
-        text(&mut lines, &run.output, Style::new());
+        lines.extend(markdown(&run.output, a.width));
     }
     if !run.files.is_empty() {
         lines.push(Line::raw(""));
@@ -345,6 +355,15 @@ mod tests {
         let items = ["done", "1d ago", "took 6m40s"].map(Span::raw).to_vec();
         let text: Vec<String> = pieces(items, 16).iter().map(Line::to_string).collect();
         assert_eq!(text, ["done · 1d ago", "took 6m40s"]);
+    }
+
+    #[test]
+    fn markdown_renders_lists_and_code() {
+        let lines = markdown("# Title\n\n- **one**\n- `two`", 40);
+        let text: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(text, ["# Title", "* one", "* two"]);
+        let one = lines[1].spans.iter().find(|s| s.content == "one").unwrap();
+        assert!(one.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

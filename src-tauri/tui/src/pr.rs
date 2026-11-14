@@ -18,6 +18,7 @@ use std::{
 // shortcut: colors fit dark terminals; read the config's theme if light ones need it.
 pub const DIM: Color = Color::Indexed(244);
 pub const ACCENT: Color = Color::Cyan;
+const CODE: Color = Color::Indexed(180);
 pub const OK: Color = Color::Green;
 pub const WARN: Color = Color::Yellow;
 pub const FAIL: Color = Color::Red;
@@ -74,14 +75,30 @@ fn review_verb(state: &str) -> &'static str {
 }
 
 /// GitHub's rendered HTML as wrapped text.
-fn html(raw: &str, width: usize) -> Vec<Line<'static>> {
-    let text = html2text::config::plain()
-        .string_from_read(raw.as_bytes(), width.max(20))
-        .unwrap_or_else(|_| raw.to_string());
-    text.trim_end()
-        .lines()
-        .map(|l| Line::raw(l.to_string()))
-        .collect()
+pub fn html(raw: &str, width: usize) -> Vec<Line<'static>> {
+    use html2text::render::RichAnnotation as A;
+    let Ok(lines) = html2text::config::rich().lines_from_read(raw.as_bytes(), width.max(20)) else {
+        return raw.lines().map(|l| Line::raw(l.to_string())).collect();
+    };
+    let span = |s: &str, tags: &[A]| {
+        let style = tags.iter().fold(Style::new(), |st, a| match a {
+            A::Strong => st.bold(),
+            A::Emphasis => st.italic(),
+            A::Strikeout => st.crossed_out(),
+            A::Code | A::Preformat(_) => st.fg(CODE),
+            A::Link(_) => st.underlined(),
+            _ => st,
+        });
+        Span::styled(s.to_string(), style)
+    };
+    let mut out: Vec<Line<'static>> = lines
+        .iter()
+        .map(|l| Line::from_iter(l.tagged_strings().map(|t| span(&t.s, &t.tag))))
+        .collect();
+    while out.last().is_some_and(|l| l.width() == 0) {
+        out.pop();
+    }
+    out
 }
 
 /// A patch through `delta`, or colored by hand when it isn't installed.
