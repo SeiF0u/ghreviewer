@@ -5,6 +5,8 @@ default-members = [".", "core", "tui"]
 
 [package]
 name = "ghreviewer"
+# `tauri dev` runs a bare `cargo run`, and the workspace also has the TUI's binary.
+default-run = "ghreviewer"
 version = "0.1.0"
 description = "Local GitHub PR reviewer"
 authors = ["johnoppenheimer"]
