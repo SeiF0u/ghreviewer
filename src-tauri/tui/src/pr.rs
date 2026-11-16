@@ -5,6 +5,7 @@ use ghreviewer_core::{
     inbox::{parse_ms, rel_time, tail_patch},
     jira::Ticket,
 };
+use html2text::render::{RichAnnotation as A, TextDecorator};
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -76,10 +77,115 @@ fn review_verb(state: &str) -> &'static str {
     }
 }
 
-/// GitHub's rendered HTML as wrapped text.
+/// html2text's rich decorator, with a `#2# ` marker on each line of a heading for `html` to style
+/// and strip. Prefixes stay ASCII: html2text measures them in bytes.
+#[derive(Clone)]
+struct Deco;
+
+impl TextDecorator for Deco {
+    type Annotation = A;
+    fn decorate_link_start(&mut self, url: &str) -> (String, A) {
+        (String::new(), A::Link(url.into()))
+    }
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_em_start(&self) -> (String, A) {
+        (String::new(), A::Emphasis)
+    }
+    fn decorate_em_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_strong_start(&self) -> (String, A) {
+        (String::new(), A::Strong)
+    }
+    fn decorate_strong_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_strikeout_start(&self) -> (String, A) {
+        (String::new(), A::Strikeout)
+    }
+    fn decorate_strikeout_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_code_start(&self) -> (String, A) {
+        (String::new(), A::Code)
+    }
+    fn decorate_code_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_preformat_first(&self) -> A {
+        A::Preformat(false)
+    }
+    fn decorate_preformat_cont(&self) -> A {
+        A::Preformat(true)
+    }
+    fn decorate_image(&mut self, src: &str, title: &str) -> (String, A) {
+        (format!("[{title}]"), A::Image(src.into()))
+    }
+    fn header_prefix(&self, level: usize) -> String {
+        format!("#{level}# ")
+    }
+    fn quote_prefix(&self) -> String {
+        "> ".into()
+    }
+    fn unordered_item_prefix(&self) -> String {
+        "* ".into()
+    }
+    fn ordered_item_prefix(&self, i: i64) -> String {
+        format!("{i}. ")
+    }
+    fn make_subblock_decorator(&self) -> Self {
+        Deco
+    }
+}
+
+/// The heading level of a line, and its start with html2text's markers made readable: the
+/// heading marker gone, `> ` as `│ `, `* ` as `• `.
+fn markers(s: &str) -> (u8, String) {
+    let (mut out, mut rest) = (String::new(), s);
+    loop {
+        let text = rest.trim_start_matches(' ');
+        out.push_str(&rest[..rest.len() - text.len()]);
+        rest = text;
+        let b = rest.as_bytes();
+        if let Some(r) = rest.strip_prefix("> ") {
+            (out, rest) = (out + "│ ", r);
+        } else if let Some(r) = rest.strip_prefix("* ") {
+            return (0, out + "• " + r);
+        } else if b.len() >= 4 && b[0] == b'#' && b[1].is_ascii_digit() && &b[2..4] == b"# " {
+            return (b[1] - b'0', out + &rest[4..]);
+        } else {
+            return (0, out + rest);
+        }
+    }
+}
+
+/// GitHub's task-list checkboxes, which html2text drops, as ☑ / ☐.
+fn checkboxes(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(at) = rest.find("<input") {
+        let end = rest[at..].find('>').map_or(rest.len(), |e| at + e + 1);
+        let tag = &rest[at..end];
+        out.push_str(&rest[..at]);
+        if tag.contains("checkbox") {
+            out.push_str(if tag.contains("checked") {
+                "☑ "
+            } else {
+                "☐ "
+            });
+        }
+        rest = &rest[end..];
+    }
+    out + rest
+}
+
+/// GitHub's rendered HTML as wrapped, styled lines.
 pub fn html(raw: &str, width: usize) -> Vec<Line<'static>> {
-    use html2text::render::RichAnnotation as A;
-    let Ok(lines) = html2text::config::rich().lines_from_read(raw.as_bytes(), width.max(20)) else {
+    let raw = checkboxes(raw);
+    let config = html2text::config::with_decorator(Deco);
+    let Ok(lines) = config.lines_from_read(raw.as_bytes(), width.max(20)) else {
         return raw.lines().map(|l| Line::raw(l.to_string())).collect();
     };
     let span = |s: &str, tags: &[A]| {
@@ -89,14 +195,39 @@ pub fn html(raw: &str, width: usize) -> Vec<Line<'static>> {
             A::Strikeout => st.crossed_out(),
             A::Code | A::Preformat(_) => st.fg(CODE),
             A::Link(_) => st.underlined(),
+            A::Image(_) => st.fg(DIM),
             _ => st,
         });
         Span::styled(s.to_string(), style)
     };
-    let mut out: Vec<Line<'static>> = lines
-        .iter()
-        .map(|l| Line::from_iter(l.tagged_strings().map(|t| span(&t.s, &t.tag))))
-        .collect();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut in_heading = false;
+    for l in &lines {
+        let mut level = 0;
+        let mut line = Line::from_iter(l.tagged_strings().enumerate().map(|(i, t)| {
+            let code = t.tag.iter().any(|a| matches!(a, A::Preformat(_)));
+            if i > 0 || code {
+                return span(&t.s, &t.tag);
+            }
+            let (l, text) = markers(&t.s);
+            level = l;
+            span(&text, &t.tag)
+        }));
+        if level > 0 {
+            let style = if level <= 2 {
+                Style::new().bold().fg(ACCENT)
+            } else {
+                Style::new().bold()
+            };
+            // A gap above a heading that follows text, which html2text leaves out.
+            if !in_heading && out.last().is_some_and(|l| l.width() > 0) {
+                out.push(Line::default());
+            }
+            line = line.patch_style(style);
+        }
+        in_heading = level > 0;
+        out.push(line);
+    }
     while out.last().is_some_and(|l| l.width() == 0) {
         out.pop();
     }
@@ -503,4 +634,38 @@ pub fn jira_lines(t: &Ticket, keys: &[String], width: usize, now: u64) -> Vec<Li
         out.extend(html(&c.body_html, width));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(h: &str) -> Vec<String> {
+        html(h, 40).iter().map(Line::to_string).collect()
+    }
+
+    #[test]
+    fn html_styles_headings_and_lists_without_markdown_markers() {
+        let lines = html(
+            "<p>intro</p><h2>Summary</h2><ul><li>a <code>x</code></li></ul>",
+            40,
+        );
+        let shown: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(shown, ["intro", "", "Summary", "• a x"]);
+        assert!(lines[2].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(text("<p># not a heading</p>"), ["# not a heading"]);
+        let h = "<blockquote><ul><li>q</li></ul></blockquote><pre><code>* not\n# not</code></pre>";
+        assert_eq!(text(h), ["│ • q", "", "* not", "# not"]);
+        let long = "<h3>A heading long enough to wrap onto a second line</h3>";
+        assert_eq!(
+            text(long),
+            ["A heading long enough to wrap onto a", "second line"]
+        );
+    }
+
+    #[test]
+    fn task_lists_keep_their_checkboxes() {
+        let h = r#"<ul><li><input type="checkbox" checked disabled> done</li><li><input type="checkbox" disabled> todo</li></ul>"#;
+        assert_eq!(text(h), ["• ☑ done", "• ☐ todo"]);
+    }
 }

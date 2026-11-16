@@ -371,7 +371,7 @@ mod tests {
     fn markdown_renders_lists_and_code() {
         let lines = markdown("# Title\n\n- **one**\n- `two`", 40);
         let text: Vec<String> = lines.iter().map(Line::to_string).collect();
-        assert_eq!(text, ["# Title", "* one", "* two"]);
+        assert_eq!(text, ["Title", "• one", "• two"]);
         let one = lines[1].spans.iter().find(|s| s.content == "one").unwrap();
         assert!(one.style.add_modifier.contains(Modifier::BOLD));
     }
