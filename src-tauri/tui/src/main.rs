@@ -736,9 +736,14 @@ impl App {
         self.load_detail();
     }
 
+    /// Scrolling stops once the last line is at the bottom.
+    fn max_scroll(&self) -> u16 {
+        (self.pane_lines as u16).saturating_sub(self.pane_height)
+    }
+
     fn scroll_by(&mut self, delta: i32) {
-        let max = self.pane_lines as i32;
-        self.scroll = (self.scroll as i32 + delta).clamp(0, (max - 1).max(0)) as u16;
+        let max = self.max_scroll() as i32;
+        self.scroll = (self.scroll as i32 + delta).clamp(0, max) as u16;
     }
 
     fn open(&mut self) {
@@ -1549,6 +1554,7 @@ impl App {
                     self.scroll = at + 3 - h;
                 }
             }
+            self.scroll = self.scroll.min(self.max_scroll());
             let para = Paragraph::new(view.lines)
                 .block(block)
                 .scroll((self.scroll, 0));
@@ -1573,12 +1579,11 @@ impl App {
             self.lines = Some((shows, inner.width, lines));
         }
         let lines = self.lines.as_ref().unwrap().2.clone();
-        self.pane_lines = lines.len();
-        let para = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
-        f.render_widget(para, area);
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.pane_lines = para.line_count(inner.width);
+        self.scroll = self.scroll.min(self.max_scroll());
+        f.render_widget(block, area);
+        f.render_widget(para.scroll((self.scroll, 0)), inner);
     }
 
     fn draw_help(&self, f: &mut Frame) {
