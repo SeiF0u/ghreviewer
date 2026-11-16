@@ -36,6 +36,10 @@ xattr -dr com.apple.quarantine /Applications/ghreviewer.app
 
 or try to open it, then go to System Settings → Privacy & Security → **Open Anyway**.
 
+### The `ghr` command (terminal UI)
+
+The app carries `ghr`, the same app in a terminal (see [Terminal UI](#terminal-ui-experimental)). To put it on your PATH, open the command palette (`:`) and run **install ghr command**: it links `/usr/local/bin/ghr` to the copy inside the app, after asking for your password. It shares the app's config and cache, and gets your GitHub token from `gh` like the app does.
+
 ### From source
 
 You need [mise](https://mise.jdx.dev), which installs the pinned Rust and Bun versions.
@@ -278,10 +282,12 @@ mise run fmt    # cargo fmt + oxfmt
 
 ### Terminal UI (experimental)
 
-`src-tauri/tui/` is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox with active runs above it, the PR, its Jira tickets, review bots' open threads, prompt runs and their findings (pick, post, fix), approving, worktrees and the repos column (`h` from the inbox; it stays on screens 140 columns wide). It uses the config theme's colors when the terminal has 24-bit color (`COLORTERM=truecolor`), `,` edits the config in `$EDITOR`, and `O` opens a file a run wrote. Not yet images. `?` lists the keys.
+`ghr` (`src-tauri/tui/`) is the same app in a terminal, over the same `core/` crate, config and cache: for a server over SSH, or a tmux/zellij pane. It has the inbox with active runs above it, the PR, its Jira tickets, review bots' open threads, prompt runs and their findings (pick, post, fix), approving, worktrees and the repos column (`h` from the inbox; it stays on screens 140 columns wide). It uses the config theme's colors when the terminal has 24-bit color (`COLORTERM=truecolor`), `,` edits the config in `$EDITOR`, and `O` opens a file a run wrote. Not yet images. `?` lists the keys.
+
+Install it from the app (see [The `ghr` command](#the-ghr-command-terminal-ui)), or from a clone:
 
 ```sh
-mise run tui
+mise run tui   # run it from source
 ```
 
 Review-comment hunks go through [delta](https://github.com/dandavison/delta) when it's installed. Over SSH, `o` copies the PR link to your clipboard (OSC 52; tmux needs `set -g set-clipboard on`).

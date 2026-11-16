@@ -15,8 +15,15 @@ description = "Run the terminal UI"
 run = "cargo run --manifest-path src-tauri/Cargo.toml -p ghreviewer-tui"
 
 [tasks.build]
-description = "Build the macOS app bundle"
-run = "bun tauri build"
+description = "Build the macOS app bundle, with the ghr command inside"
+# tauri build makes ghr too (a workspace member); the app installs it into PATH from its palette.
+run = '''
+set -e
+bun tauri build
+app=src-tauri/target/release/bundle/macos/ghreviewer.app
+cp src-tauri/target/release/ghr "$app/Contents/MacOS/ghr"
+codesign --force --deep --sign - "$app"
+'''
 
 [tasks.dmg]
 description = "Build a .dmg to share (ad-hoc signed, not notarized)"

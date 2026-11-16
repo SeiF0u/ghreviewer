@@ -645,6 +645,7 @@ export default function App() {
     { label: "refresh", run: () => fire(api.refresh()) },
     { label: "settings", run: () => setOverlay("settings") },
     { label: "open config file", run: () => fire(api.openConfig()) },
+    { label: "install ghr command (terminal UI)", run: () => fire(api.installCli()) },
     { label: "open PR in browser", run: openSelected },
     { label: "toggle unread", run: toggleUnread },
     ...(config?.smart_inbox && selected

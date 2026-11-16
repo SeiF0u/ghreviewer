@@ -3,6 +3,11 @@ name = "ghreviewer-tui"
 version = "0.1.0"
 edition = "2024"
 
+# The command: shipped inside the .app, linked into PATH from its command palette.
+[[bin]]
+name = "ghr"
+path = "src/main.rs"
+
 [dependencies]
 ansi-to-tui = "8.0.1"
 anyhow = "1.0.104"

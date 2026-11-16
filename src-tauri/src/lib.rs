@@ -72,6 +72,45 @@ fn set_repo_flag(st: St<'_>, repo: String, flag: String, on: bool) -> Res<()> {
     backend::set_repo_flag(&st, &repo, &flag, on).map_err(err)
 }
 
+/// Links the `ghr` bundled next to the app into /usr/local/bin (on every Mac's PATH), asking
+/// for an admin password like VS Code's `code` command.
+#[tauri::command]
+async fn install_cli() -> Res<()> {
+    let exe = std::env::current_exe().map_err(err)?;
+    let ghr = exe.with_file_name("ghr");
+    if !ghr.is_file() {
+        return Err(format!(
+            "no ghr next to the app ({}): build it with `mise run build`",
+            ghr.display()
+        ));
+    }
+    let quoted = ghr
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let script = format!(
+        r#"do shell script "mkdir -p /usr/local/bin && ln -sf " & quoted form of "{quoted}" & " /usr/local/bin/ghr" with administrator privileges
+display alert "ghr is installed" message "Run ghr in a terminal: the inbox, PRs and runs, over the same config as the app.""#
+    );
+    // Off the async runtime: it waits for the password prompt.
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match out.status.success() {
+        true => Ok(()),
+        // Cancelling the password prompt is not an error worth showing.
+        false if stderr.contains("-128") => Ok(()),
+        false => Err(format!("installing ghr failed: {}", stderr.trim())),
+    }
+}
+
 #[tauri::command]
 fn open_config(st: St<'_>) -> Res<()> {
     std::process::Command::new("open")
@@ -317,6 +356,7 @@ pub fn run() {
             save_settings,
             set_repo_flag,
             open_config,
+            install_cli,
             get_worktree,
             create_worktree,
             open_worktree,

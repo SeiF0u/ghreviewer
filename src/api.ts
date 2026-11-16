@@ -263,6 +263,8 @@ export const api = {
   setRepoFlag: (repo: string, flag: "pinned" | "hidden", on: boolean) =>
     invoke<void>("set_repo_flag", { repo, flag, on }),
   openConfig: () => invoke<void>("open_config"),
+  /** Links the bundled `ghr` (the terminal UI) into /usr/local/bin; asks for an admin password. */
+  installCli: () => invoke<void>("install_cli"),
   worktree: (repo: string, branch: string) => invoke<Worktree>("get_worktree", { repo, branch }),
   createWorktree: (repo: string, number: number) =>
     invoke<void>("create_worktree", { repo, number }),
