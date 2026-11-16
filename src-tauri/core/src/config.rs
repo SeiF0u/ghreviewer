@@ -72,6 +72,8 @@ command = ["open", "-a", "Cursor", "{path}"]
 # prompt = "/pr-review {url}\n\n{review_format}"
 # harness = "greptile" runs `greptile review --json -b {base}` instead: its findings, to pick and
 # post or fix, with `prompt` as optional extra instructions. Each run costs a Greptile review.
+# Optional `run_on` runs a prompt by itself on others' non-draft PRs: "new" once when a PR shows up
+# in the inbox, "changes" then too and again on each push. PRs already there at launch don't count.
 # Agents read PR text written by others and act with your rights: allow only what a prompt needs
 # (claude: --allowedTools as below; opencode: `deny` rules such as `gh pr review *` in its config).
 # [[prompts]]
@@ -176,6 +178,18 @@ pub struct Prompt {
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub run_on: Option<RunOn>,
+}
+
+/// When a prompt runs without being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOn {
+    /// When a PR shows up in the inbox.
+    New,
+    /// When a PR shows up, and on each push to it.
+    Changes,
 }
 
 /// `[fix]`: the agent that fixes the findings picked in a review.
@@ -430,7 +444,13 @@ mod tests {
             toml::from_str::<Config>(&text).unwrap()
         };
         let p = uncomment("# [[prompts]]", 5).prompts.remove(0);
-        assert_eq!((p.harness, p.args.len()), (Harness::Claude, 5));
+        assert_eq!(
+            (p.harness, p.args.len(), p.run_on),
+            (Harness::Claude, 5, None)
+        );
+        let p: Prompt =
+            toml::from_str("name = \"x\"\nharness = \"claude\"\nrun_on = \"changes\"").unwrap();
+        assert_eq!(p.run_on, Some(RunOn::Changes));
         assert_eq!(uncomment("# terminal", 1).terminal.len(), 7);
         let fix = uncomment("# [fix]", 4).fix.unwrap();
         assert!(fix.prompt.contains("{findings}") && fix.args.len() == 4);

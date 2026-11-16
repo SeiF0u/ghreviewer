@@ -538,6 +538,7 @@ mod tests {
             jira: Vec::new(),
             next,
             snoozed_until: None,
+            head_oid: None,
         }
     }
 

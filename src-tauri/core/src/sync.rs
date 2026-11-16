@@ -51,6 +51,9 @@ pub struct PrSummary {
     /// Snoozed by the user until then (ms), for the smart inbox. Filled when the inbox is read.
     #[serde(default)]
     pub snoozed_until: Option<u64>,
+    /// Head commit, to start `run_on = "changes"` prompts on pushes.
+    #[serde(default)]
+    pub head_oid: Option<String>,
 }
 
 /// Smart inbox state; `NEXT_ORDER` in src/model.ts ranks them.
@@ -154,7 +157,7 @@ fragment PrFields on PullRequest {{
   baseRefName headRefName isCrossRepository
   author {{ login }}
   repository {{ nameWithOwner defaultBranchRef {{ name }} }}
-  commits(last: 1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ state }} }} }} }}
+  commits(last: 1) {{ nodes {{ commit {{ oid committedDate statusCheckRollup {{ state }} }} }} }}
   reviewRequests(first: 20) {{ nodes {{ requestedReviewer {{ ... on User {{ login }} }} }} }}
   latestReviews(first: 20) {{ nodes {{ author {{ __typename login }} state submittedAt }} }}
   timelineItems(last: 10, itemTypes: [{ACTIVITY_TYPES}]) {{
@@ -275,6 +278,7 @@ struct CommitNode {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommitRollup {
+    oid: Option<String>,
     committed_date: Option<String>,
     status_check_rollup: Option<Rollup>,
 }
@@ -396,14 +400,17 @@ fn next_step(pr: &SearchPr, viewer: &str) -> Next {
 fn summarize(pr: SearchPr, viewer: &str) -> PrSummary {
     let last_others_activity_at = last_others_activity(&pr, viewer);
     let next = Some(next_step(&pr, viewer));
-    let checks = pr
+    let head = pr
         .commits
         .nodes
         .into_iter()
         .flatten()
         .next()
-        .and_then(|c| c.commit.status_check_rollup)
-        .map(|r| r.state);
+        .map(|c| c.commit);
+    let (head_oid, checks) = match head {
+        Some(c) => (c.oid, c.status_check_rollup.map(|r| r.state)),
+        None => (None, None),
+    };
     PrSummary {
         id: pr.id,
         number: pr.number,
@@ -426,6 +433,7 @@ fn summarize(pr: SearchPr, viewer: &str) -> PrSummary {
         jira: vec![],
         next,
         snoozed_until: None,
+        head_oid,
     }
 }
 

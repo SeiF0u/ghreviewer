@@ -15,7 +15,7 @@ pub mod sync;
 
 use agent::{Finding, Review, Run, RunStatus};
 use anyhow::{Context, bail, ensure};
-use config::{Config, Prompt, Settings};
+use config::{Config, Prompt, RunOn, Settings};
 use db::Db;
 use github::Github;
 use notify::{RecursiveMode, Watcher};
@@ -62,6 +62,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     runs: Mutex<HashMap<(String, String), RunningTask>>,
     run_seq: AtomicU64,
+    /// Head commit of each PR `run_on` prompts apply to, as of the last sync. `None` before the first.
+    seen_heads: Mutex<Option<HashMap<String, String>>>,
     on_event: Box<dyn Fn(Event) + Send + Sync>,
     /// Background work is spawned here: some callers aren't on a runtime thread.
     rt: Handle,
@@ -118,6 +120,7 @@ impl AppState {
             data_dir,
             runs: Mutex::default(),
             run_seq: AtomicU64::new(0),
+            seen_heads: Mutex::default(),
             on_event: Box::new(on_event),
             rt,
         });
@@ -270,6 +273,72 @@ async fn prefetch_details(st: &Arc<AppState>) {
     }
 }
 
+/// The `run_on` prompts to start on each PR, given the head commits (by PR id) of the last sync
+/// and of this one.
+fn auto_runs<'a>(
+    prompts: &'a [Prompt],
+    seen: &HashMap<String, String>,
+    heads: &HashMap<String, String>,
+) -> Vec<(String, Vec<&'a Prompt>)> {
+    let mut out = vec![];
+    for (id, head) in heads {
+        let new = !seen.contains_key(id);
+        let pushed = seen.get(id).is_some_and(|h| h != head);
+        let due: Vec<&Prompt> = prompts
+            .iter()
+            .filter(|p| match p.run_on {
+                Some(RunOn::New) => new,
+                Some(RunOn::Changes) => new || pushed,
+                None => false,
+            })
+            .collect();
+        if !due.is_empty() {
+            out.push((id.clone(), due));
+        }
+    }
+    out
+}
+
+/// Starts `run_on` prompts on others' non-draft inbox PRs that showed up or got pushed to since the
+/// last sync. The first sync only records them, so launching doesn't start a run on every PR.
+async fn auto_run(st: &Arc<AppState>) {
+    let (prompts, filters) = {
+        let cfg = st.cfg.read().unwrap();
+        (cfg.prompts.clone(), cfg.filters.clone())
+    };
+    let viewer = st.status.lock().unwrap().viewer.clone();
+    let Ok(inbox) = st.db.inbox(&filters) else {
+        return;
+    };
+    let heads: HashMap<String, String> = inbox
+        .into_iter()
+        .filter(|pr| !pr.context && !pr.is_draft && Some(&pr.author) != viewer.as_ref())
+        .map(|pr| (pr.id, pr.head_oid.unwrap_or_default()))
+        .collect();
+    let Some(seen) = st.seen_heads.lock().unwrap().replace(heads.clone()) else {
+        return;
+    };
+    for (id, due) in auto_runs(&prompts, &seen, &heads) {
+        // The detail has the branch even for forks, and warms the cache for opening the PR.
+        let detail = refresh_detail(st, &id).await.ok();
+        let started = detail.is_some_and(|d| {
+            due.into_iter().all(|spec| {
+                let target = Target::from_detail(&d);
+                target.is_some_and(|t| start_run(st, spec.clone(), t, String::new()).is_ok())
+            })
+        });
+        if !started {
+            // Try again on the next sync.
+            let mut now = st.seen_heads.lock().unwrap();
+            let now = now.get_or_insert_default();
+            match seen.get(&id) {
+                Some(h) => now.insert(id, h.clone()),
+                None => now.remove(&id),
+            };
+        }
+    }
+}
+
 async fn poller(st: Arc<AppState>) {
     let mut repos_at: Option<Instant> = None;
     loop {
@@ -277,6 +346,7 @@ async fn poller(st: Arc<AppState>) {
             || repos_at.is_none_or(|t| t.elapsed() > REPOS_EVERY);
         update_status(&st, |s| s.syncing = true);
         let res = sync_once(&st, with_repos).await;
+        let synced = res.is_ok();
         if res.is_ok() && with_repos {
             repos_at = Some(Instant::now());
         }
@@ -301,6 +371,9 @@ async fn poller(st: Arc<AppState>) {
             }
         });
         st.changed();
+        if synced {
+            auto_run(&st).await;
+        }
         prefetch_details(&st).await;
         let secs = st.cfg.read().unwrap().poll_interval_secs.max(30);
         tokio::select! {
@@ -595,6 +668,7 @@ pub fn fix_findings(st: &Arc<AppState>, pr: Target, findings: &[Finding]) -> any
         harness: fix.harness,
         prompt: fix.prompt,
         args: fix.args,
+        run_on: None,
     };
     start_run(st, spec, pr, agent::findings_text(findings))
 }
@@ -759,6 +833,41 @@ mod tests {
         assert!(is_current(&running, &key, 2));
         running.remove(&key); // cancelled
         assert!(!is_current(&running, &key, 2));
+    }
+
+    #[test]
+    fn run_on_new_and_changes() {
+        let p = |name: &str, run_on| Prompt {
+            name: name.into(),
+            harness: config::Harness::Claude,
+            prompt: String::new(),
+            args: vec![],
+            run_on,
+        };
+        let prompts = [
+            p("new", Some(RunOn::New)),
+            p("changes", Some(RunOn::Changes)),
+            p("manual", None),
+        ];
+        let map = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let seen = map(&[("same", "a"), ("pushed", "a")]);
+        let heads = map(&[("same", "a"), ("pushed", "b"), ("fresh", "c")]);
+        let mut got: Vec<(String, Vec<&str>)> = auto_runs(&prompts, &seen, &heads)
+            .into_iter()
+            .map(|(id, due)| (id, due.iter().map(|p| p.name.as_str()).collect()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("fresh".to_string(), vec!["new", "changes"]),
+                ("pushed".to_string(), vec!["changes"]),
+            ]
+        );
     }
 
     #[test]

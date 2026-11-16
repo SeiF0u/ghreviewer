@@ -482,6 +482,7 @@ mod tests {
             harness,
             prompt: "x".into(),
             args: vec!["--model".into(), "m".into()],
+            run_on: None,
         }
     }
 

@@ -348,6 +348,7 @@ mod tests {
             jira: vec![],
             next: None,
             snoozed_until: None,
+            head_oid: None,
         }
     }
 

@@ -543,6 +543,7 @@ impl App {
                 harness: fix.harness,
                 prompt: fix.prompt.clone(),
                 args: fix.args.clone(),
+                run_on: None,
             });
         }
         prompts
