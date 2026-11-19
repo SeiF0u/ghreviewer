@@ -30,7 +30,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use sync::{PrSummary, Repo};
+use sync::{Next, PrSummary, Repo};
 use tokio::{runtime::Handle, sync::Notify, task::JoinHandle};
 
 const REPOS_EVERY: Duration = Duration::from_secs(3600);
@@ -793,7 +793,17 @@ pub async fn post_review(
         st.db.put_run(&now)?;
     }
     st.emit(Event::RunUpdated(pr_id.to_string()));
+    reviewed(st, pr_id, approve);
     Ok(())
+}
+
+/// Puts a PR you just reviewed under "can wait" now rather than at the next sync.
+fn reviewed(st: &AppState, id: &str, approve: bool) {
+    let next = if approve { Next::Done } else { Next::Waiting };
+    let viewer = st.status.lock().unwrap().viewer.clone();
+    if st.db.set_next(id, next, viewer.as_deref()).is_ok() {
+        st.changed();
+    }
 }
 
 /// Approves the commit of a PR that was on screen (`head_oid`), with an optional message, then
@@ -809,6 +819,7 @@ pub async fn approve_pr(
         ..Default::default()
     };
     sync::post_review(&st.gh, id, Some(head_oid), &review, &[], true).await?;
+    reviewed(st, id, true);
     if let Ok(detail) = refresh_detail(st, id).await {
         st.emit(Event::PrUpdated {
             id: id.to_string(),

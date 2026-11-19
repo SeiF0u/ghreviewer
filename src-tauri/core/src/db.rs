@@ -2,7 +2,7 @@ use crate::{
     agent::Run,
     config::Filters,
     jira::Ticket,
-    sync::{PrSummary, Repo},
+    sync::{Next, PrSummary, Repo},
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -154,6 +154,16 @@ impl Db {
              ON CONFLICT(id) DO UPDATE SET seen_activity_at = excluded.seen_activity_at, forced_unread = 0"
         };
         self.conn().execute(sql, [id])?;
+        Ok(())
+    }
+
+    /// Sets the smart inbox state of a PR not authored by `viewer`, until the next sync replaces it.
+    pub fn set_next(&self, id: &str, next: Next, viewer: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE prs SET json = json_set(json, '$.next', ?2)
+             WHERE id = ?1 AND json_extract(json, '$.author') IS NOT ?3",
+            params![id, serde_json::to_value(next)?.as_str(), viewer],
+        )?;
         Ok(())
     }
 
@@ -379,6 +389,22 @@ mod tests {
         assert!(is_unread(Some("2026-01-01T00:00:00Z"), None, false));
         assert!(!is_unread(None, None, false));
         assert!(is_unread(None, None, true));
+    }
+
+    #[test]
+    fn set_next_skips_own_prs() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let t = "2026-01-01T00:00:00Z";
+        db.replace_prs(&[
+            pr("a", "bob", "o/r", false, None, t),
+            pr("b", "me", "o/r", false, None, t),
+        ])
+        .unwrap();
+        db.set_next("a", Next::Done, Some("me")).unwrap();
+        db.set_next("b", Next::Waiting, Some("me")).unwrap();
+        let inbox = db.inbox(&Filters::default()).unwrap();
+        let next = |id: &str| inbox.iter().find(|p| p.id == id).unwrap().next;
+        assert_eq!((next("a"), next("b")), (Some(Next::Done), None));
     }
 
     #[test]
