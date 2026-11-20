@@ -135,6 +135,22 @@ pub async fn head(worktree: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Fast-forwards a worktree to its upstream. `--ff-only` fails (leaving it untouched) instead of
+/// conflicting, e.g. after a force-push or when local changes are in the way.
+pub async fn pull(worktree: &str) -> Result<()> {
+    // Login shell, for the user's PATH (credential helpers like `gh`).
+    let args = ["git", "-C", worktree, "pull", "--ff-only"].map(String::from);
+    let out = login_command(&args).output().await.context("running git")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "{}",
+            stderr.trim().lines().last().unwrap_or("git pull failed")
+        );
+    }
+    Ok(())
+}
+
 /// Checked once: installing worktrunk needs an app restart to show up.
 async fn wt_installed() -> bool {
     static WT: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
@@ -276,6 +292,54 @@ mod tests {
         let t = ["sh", "-c", "x", "{name}", "{path}/{path}", "{unknown}"].map(String::from);
         let out = fill(&t, &[("path", "/a b"), ("name", "a b")]);
         assert_eq!(out, ["sh", "-c", "x", "a b", "/a b//a b", "{unknown}"]);
+    }
+
+    #[tokio::test]
+    async fn pull_fast_forwards_or_leaves_it_alone() {
+        let dir = std::env::temp_dir().join(format!("ghreviewer-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |cwd: &str, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(dir.join(cwd))
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(".", &["init", "-q", "-b", "main", "up"]);
+        git("up", &["commit", "-q", "--allow-empty", "-m", "1"]);
+        git(".", &["clone", "-q", "up", "wt"]);
+        let wt = dir.join("wt").display().to_string();
+        git("up", &["commit", "-q", "--allow-empty", "-m", "2"]);
+        pull(&wt).await.unwrap();
+        let up_head = || {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir.join("up").to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        assert_eq!(head(&wt).await.unwrap(), up_head());
+        // Diverged (like a force-push): fails without touching the worktree.
+        git(
+            "up",
+            &["commit", "-q", "--amend", "--allow-empty", "-m", "2b"],
+        );
+        git("wt", &["commit", "-q", "--allow-empty", "-m", "local"]);
+        let before = head(&wt).await.unwrap();
+        assert!(pull(&wt).await.is_err());
+        assert_eq!(head(&wt).await.unwrap(), before);
     }
 
     #[tokio::test]

@@ -601,7 +601,18 @@ async fn run_task(
         "{name} is in the middle of a rebase: finish it, then re-run"
     );
     // The commit the agent will read: an existing worktree may be behind the PR's head.
-    if let Ok(oid) = local::head(&path).await {
+    let mut head = local::head(&path).await.ok();
+    if pr.head_oid.is_some() && head.is_some() && head != pr.head_oid {
+        run.activity.push(format!("pulling {name}: behind the PR"));
+        save_run(st, token, run, false);
+        match local::pull(&path).await {
+            Ok(()) => head = local::head(&path).await.ok(),
+            Err(e) => run
+                .activity
+                .push(format!("not pulled, reviewing {name} as is: {e}")),
+        }
+    }
+    if let Some(oid) = head {
         run.head_oid = Some(oid);
     }
     let out = st.data_dir.join("runs").join(run_dir(&pr.id, &spec.name)?);
