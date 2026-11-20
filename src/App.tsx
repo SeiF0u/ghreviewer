@@ -167,6 +167,10 @@ export default function App() {
   const inbox = useQuery({ queryKey: ["inbox"], queryFn: api.inbox }).data ?? NO_PRS;
   const activeRuns =
     useQuery({ queryKey: ["activeRuns"], queryFn: api.activeRuns }).data ?? NO_RUNS;
+  const runningPrs = useMemo(
+    () => new Set(activeRuns.filter((r) => r.status === "running").map((r) => r.prId)),
+    [activeRuns],
+  );
 
   const [focus, setFocus] = useState(1);
   const [sideKey, setSideKey] = useState("all");
@@ -747,6 +751,7 @@ export default function App() {
       <Inbox
         title={scopeTitle}
         rows={rows}
+        running={runningPrs}
         smart={!!config?.smart_inbox}
         selected={selected?.id ?? null}
         focused={focus === 1}

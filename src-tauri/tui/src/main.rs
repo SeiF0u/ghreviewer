@@ -1383,6 +1383,13 @@ impl App {
                 next_color(&next),
             ));
         }
+        if self
+            .active
+            .iter()
+            .any(|r| r.pr_id == pr.id && r.status == RunStatus::Running)
+        {
+            right.push(Span::styled("… ", WARN));
+        }
         let age = parse_ms(&pr.updated_at)
             .map(|t| rel_time(t, now))
             .unwrap_or_default();

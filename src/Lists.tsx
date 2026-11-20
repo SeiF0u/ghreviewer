@@ -165,6 +165,8 @@ export function Inbox(
   props: FilterProps & {
     title: string;
     rows: PrRow[];
+    /** PRs with a prompt running on them. */
+    running: Set<string>;
     /** Smart inbox: rows come ranked (`byNext`); show each state and where "can wait" starts. */
     smart: boolean;
     selected: string | null;
@@ -177,7 +179,7 @@ export function Inbox(
     onSelect: (id: string) => void;
   },
 ) {
-  const { title, rows, smart, selected, focused, empty, now, rules, rule } = props;
+  const { title, rows, running, smart, selected, focused, empty, now, rules, rule } = props;
   const { onRule, onSelect } = props;
   const scrollRef = useScrollToSelected(selected);
   const leads = smart ? stackLeads(rows) : [];
@@ -238,6 +240,11 @@ export function Inbox(
                       title={`Ranked here for #${lead.number}, further down this stack`}
                     >
                       {lead.next} ↓#{lead.number}
+                    </span>
+                  )}
+                  {running.has(pr.id) && (
+                    <span title="A prompt is running">
+                      <PixelSpinner />
                     </span>
                   )}
                   <span className="dim">{relTime(pr.updatedAt, now)}</span>
