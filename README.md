@@ -43,7 +43,7 @@ The app carries `ghr`, the same app in a terminal (see [Terminal UI](#terminal-u
 It also has a few commands that print and exit (`ghr --help` lists them):
 
 - `ghr config-path` and `ghr cache-path` print where the config file and the cache database are.
-- `ghr sessions owner/repo#123` (or a PR URL) lists the prompts run on that PR, with each agent session id, its worktree and the command that resumes it.
+- `ghr sessions owner/repo#123` (or a PR URL) lists the prompts run on that PR, with each agent session id, its worktree and the command that resumes it. Add `--yaml` for output scripts can read.
 
 ### From source
 
