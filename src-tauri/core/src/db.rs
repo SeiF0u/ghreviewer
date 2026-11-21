@@ -228,6 +228,19 @@ impl Db {
         rows.map(|j| Ok(serde_json::from_str(&j?)?)).collect()
     }
 
+    /// Latest run of each prompt on `repo`#`number`, oldest first: for when the PR id isn't known.
+    pub fn pr_runs(&self, repo: &str, number: u64) -> Result<Vec<Run>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT json FROM runs
+             WHERE json_extract(json, '$.repo') = ?1 COLLATE NOCASE
+               AND json_extract(json, '$.number') = ?2
+             ORDER BY json_extract(json, '$.startedAt')",
+        )?;
+        let rows = stmt.query_map(params![repo, number as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|j| Ok(serde_json::from_str(&j?)?)).collect()
+    }
+
     /// Latest run of one prompt on a PR.
     pub fn run(&self, pr_id: &str, prompt: &str) -> Result<Option<Run>> {
         let json: Option<String> = self
@@ -529,6 +542,30 @@ mod tests {
             db.mark_run_seen("a", p).unwrap();
         }
         assert_eq!(active(&db), ["live"]);
+    }
+
+    #[test]
+    fn runs_by_repo_and_number() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let run = |prompt: &str, repo: &str, number, started_at| Run {
+            pr_id: format!("{repo}{number}"),
+            repo: repo.into(),
+            number,
+            prompt: prompt.into(),
+            started_at,
+            ..Default::default()
+        };
+        db.put_run(&run("review", "o/r", 7, 2)).unwrap();
+        db.put_run(&run("diagram", "o/r", 7, 1)).unwrap();
+        db.put_run(&run("review", "o/r", 8, 3)).unwrap();
+        db.put_run(&run("review", "o/other", 7, 4)).unwrap();
+        let got: Vec<_> = db
+            .pr_runs("O/R", 7)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.prompt)
+            .collect();
+        assert_eq!(got, ["diagram", "review"]);
     }
 
     #[test]

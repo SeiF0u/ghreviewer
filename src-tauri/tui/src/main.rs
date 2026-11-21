@@ -1,5 +1,6 @@
 //! ghreviewer in a terminal: the inbox and the PR, over the same core as the desktop app.
 
+mod cli;
 mod pr;
 mod run;
 
@@ -1740,6 +1741,10 @@ impl App {
 }
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return cli::main(&args);
+    }
     let rt = tokio::runtime::Runtime::new()?;
     let (tx, rx) = mpsc::channel();
     let events = tx.clone();

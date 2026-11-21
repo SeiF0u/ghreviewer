@@ -40,6 +40,11 @@ or try to open it, then go to System Settings → Privacy & Security → **Open 
 
 The app carries `ghr`, the same app in a terminal (see [Terminal UI](#terminal-ui-experimental)). To put it on your PATH, open the command palette (`:`) and run **install ghr command**: it links `/usr/local/bin/ghr` to the copy inside the app, after asking for your password. It shares the app's config and cache, and gets your GitHub token from `gh` like the app does.
 
+It also has a few commands that print and exit (`ghr --help` lists them):
+
+- `ghr config-path` and `ghr cache-path` print where the config file and the cache database are.
+- `ghr sessions owner/repo#123` (or a PR URL) lists the prompts run on that PR, with each agent session id, its worktree and the command that resumes it.
+
 ### From source
 
 You need [mise](https://mise.jdx.dev), which installs the pinned Rust and Bun versions.

@@ -91,13 +91,18 @@ pub fn err(e: impl Into<anyhow::Error>) -> String {
     format!("{:#}", e.into())
 }
 
+/// Where the cache (`cache.db`) and other app data live.
+pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::data_dir().context("no data dir")?.join("ghreviewer"))
+}
+
 impl AppState {
     /// Loads the config and opens the cache. A broken config still opens, with `config_error`.
     pub fn open(
         on_event: impl Fn(Event) + Send + Sync + 'static,
         rt: Handle,
     ) -> anyhow::Result<Arc<Self>> {
-        let data_dir = dirs::data_dir().context("no data dir")?.join("ghreviewer");
+        let data_dir = data_dir()?;
         std::fs::create_dir_all(&data_dir)?;
         let cfg_path = config::path();
         config::ensure(&cfg_path)?;
